@@ -1,0 +1,12 @@
+# Build output (create with build/Build-IntuneComplianceTool.ps1 or ./ict.sh)
+dist/
+
+# Local runs on a dev machine
+output/
+*.log
+
+# Test results
+testResults.xml
+coverage.xml
+
+.DS_Store
