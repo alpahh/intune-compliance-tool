@@ -1,13 +1,15 @@
 function Invoke-ICTRemediation {
     <#
     .SYNOPSIS
-        Runs the repairs an evaluation recommends, in escalating order.
+        Runs the repairs an evaluation recommends.
     .DESCRIPTION
-        Enrollment: Sync first when only the check-in is stale; if the sync does not
-        produce a successful check-in, escalate to a full re-enrollment. A broken
-        enrollment (missing/expired certificate, missing tasks, no enrollment) goes
-        straight to re-enrollment. Blockers stop the enrollment repair unless -Force.
-        LAPS: retries LAPS policy processing when the backup failed or rotation is overdue.
+        Order: TimeSync (w32tm resync), ServiceFix (re-enable / start MDM services),
+        then the enrollment repair, then LapsRetry.
+        Enrollment: a stale check-in gets a sync first; if the sync does not produce a
+        successful check-in, it escalates to a re-enrollment (EscalateSyncToReEnroll).
+        A broken enrollment goes straight to re-enrollment. Blockers stop the
+        enrollment repair; -Force overrides them, but never the re-enrollment's own
+        safety checks (Entra join, a usable signed-in user).
 
         Status: NothingToDo | WhatIf | Blocked | Succeeded | Failed
     #>
@@ -16,7 +18,10 @@ function Invoke-ICTRemediation {
         [Parameter(Mandatory)][psobject]$Evaluation,
         [psobject]$Config,
         [ValidateSet('UserCredential', 'DeviceCredential')][string]$Method,
-        [switch]$Force
+        [string[]]$ExcludeAccount = @(),
+        [string]$WorkDirectory,
+        [switch]$Force,
+        [scriptblock]$OnProgress
     )
 
     if (-not $Config) { $Config = Get-ICTConfig }
@@ -24,103 +29,115 @@ function Invoke-ICTRemediation {
     $preview = [bool]$WhatIfPreference
 
     $steps = New-Object 'System.Collections.Generic.List[object]'
+    $state = @{ Failed = $false; Blocked = $false; Changed = $false }
     $result = [pscustomobject]@{
-        Requested    = $true
-        WhatIf       = $preview
-        Status       = 'NothingToDo'
-        Blockers     = @()
-        ChangesMade  = $false
-        Sync         = $null
-        ReEnrollment = $null
-        LapsRetry    = $null
-        Steps        = $null
+        WhatIf = $preview; Status = 'NothingToDo'; Blockers = @(); ChangesMade = $false
+        Sync = $null; ReEnrollment = $null; LapsRetry = $null; Steps = $null
+    }
+    # Runs one repair: records its steps, and a failure instead of throwing.
+    $run = {
+        param([string]$Name, [scriptblock]$Repair)
+        try {
+            $outcome = & $Repair
+            if ($outcome -and $outcome.PSObject.Properties['Steps']) {
+                foreach ($step in @($outcome.Steps)) { $steps.Add($step) }
+                if (-not $preview -and $outcome.Status -ne 'Blocked' -and $outcome.Status -ne 'NoEnrollment') { $state.Changed = $true }
+                if (-not $preview -and -not $outcome.Succeeded -and $outcome.Status -ne 'Blocked') { $state.Failed = $true }
+            }
+            return $outcome
+        }
+        catch {
+            $steps.Add((New-ICTStep $Name Fail $_.Exception.Message))
+            if (-not $preview) { $state.Failed = $true; $state.Changed = $true }   # it may have changed something before failing
+        }
     }
 
     $actions = @($Evaluation.RecommendedActions)
     if ($actions.Count -eq 0) {
-        $steps.Add((New-ICTStep -Name 'Repair' -Status Info -Detail 'nothing to repair'))
+        $steps.Add((New-ICTStep 'Repair' Info 'nothing to repair'))
         $result.Steps = $steps.ToArray()
         return $result
     }
 
-    $failed = $false
-    $blocked = $false
-    $enrollmentAction = $null
-    if ($actions -contains 'ReEnroll') { $enrollmentAction = 'ReEnroll' }
-    elseif ($actions -contains 'Sync') { $enrollmentAction = 'Sync' }
+    $clockFixed = $true
+    if ($actions -contains 'TimeSync') {
+        $failedBefore = $state.Failed
+        $null = & $run 'Time sync' {
+            if ($preview) { return [pscustomobject]@{ Succeeded = $true; Status = 'WhatIf'; Steps = @(New-ICTStep 'Time sync' Info 'would resynchronise the clock (w32tm /resync)') } }
+            Invoke-ICTTimeResync
+            [pscustomobject]@{ Succeeded = $true; Status = 'Succeeded'; Steps = @(New-ICTStep 'Time sync' Pass 'clock resynchronised') }
+        }
+        $clockFixed = ($state.Failed -eq $failedBefore)
+    }
 
-    if ($enrollmentAction) {
-        $blockers = @($Evaluation.Blockers)
+    if ($actions -contains 'ServiceFix') {
+        foreach ($finding in @($Evaluation.Results | Where-Object { $_.Action -eq 'ServiceFix' })) {
+            $service = $finding.Id.Substring(4)
+            $null = & $run "Service $service" {
+                $startType = $(if ($service -eq 'IntuneManagementExtension') { 'Automatic' } else { 'Manual' })
+                $what = $(if ($finding.Actual -eq 'disabled') { "set to $startType" + $(if ($startType -eq 'Automatic') { ' and start' } else { '' }) } else { 'start' })
+                if ($preview) { return [pscustomobject]@{ Succeeded = $true; Status = 'WhatIf'; Steps = @(New-ICTStep "Service $service" Info "would $what") } }
+                if ($finding.Actual -eq 'disabled') { Set-ICTServiceStartType -Name $service -StartupType $startType }
+                if ($finding.Actual -ne 'disabled' -or $startType -eq 'Automatic') { Start-ICTService -Name $service }
+                [pscustomobject]@{ Succeeded = $true; Status = 'Succeeded'; Steps = @(New-ICTStep "Service $service" Pass ($what -replace '^set', 'set' -replace '^start', 'started')) }
+            }
+        }
+    }
+
+    $enrollmentAction = @($actions | Where-Object { $_ -eq 'ReEnroll' -or $_ -eq 'Sync' }) | Select-Object -First 1
+    if ($enrollmentAction -and -not $clockFixed) {
+        # With a wrong clock, certificate checks fail: a sync or a new enrollment would fail too.
+        $state.Blocked = $true
+        $result.Blockers = @('Clock: could not be resynchronised')
+        $steps.Add((New-ICTStep 'Enrollment repair' Fail 'skipped: the clock could not be fixed'))
+        $enrollmentAction = $null
+    }
+    $reEnroll = {
+        $blockers = @($Evaluation.ReEnrollBlockers)
         if ($blockers.Count -gt 0 -and -not $Force) {
-            $blocked = $true
+            $state.Blocked = $true
             $result.Blockers = $blockers
-            $steps.Add((New-ICTStep -Name 'Enrollment repair' -Status Fail -Detail ('blocked: {0}' -f ($blockers -join '; '))))
+            $steps.Add((New-ICTStep 'Re-enroll' Fail ('blocked: {0}' -f ($blockers -join '; '))))
+            return
+        }
+        if ($blockers.Count -gt 0) { $steps.Add((New-ICTStep 'Blockers' Warning ('ignored (-Force): {0}' -f ($blockers -join '; ')))) }
+        $result.ReEnrollment = & $run 'Re-enroll' {
+            Invoke-ICTReEnrollment -Method $Method -WorkDirectory $WorkDirectory -ExcludeAccount $ExcludeAccount -ScriptTimeoutSeconds $Config.RepairScriptTimeoutSeconds `
+                -TimeoutSeconds $Config.EnrollmentTimeoutSeconds -OnProgress $OnProgress -WhatIf:$preview -Confirm:$false
+        }
+        if ($result.ReEnrollment.Status -eq 'Blocked') {
+            $state.Blocked = $true
+            $result.Blockers = @($result.ReEnrollment.Message)
+        }
+    }
+
+    if ($enrollmentAction -eq 'Sync') {
+        $syncBlockers = @($Evaluation.SyncBlockers)
+        if ($syncBlockers.Count -gt 0 -and -not $Force) {
+            $state.Blocked = $true
+            $result.Blockers = $syncBlockers
+            $steps.Add((New-ICTStep 'Sync' Fail ('blocked: {0}' -f ($syncBlockers -join '; '))))
         }
         else {
-            if ($blockers.Count -gt 0) {
-                $steps.Add((New-ICTStep -Name 'Blockers' -Status Warning -Detail ('ignored (-Force): {0}' -f ($blockers -join '; '))))
+            $failedBeforeSync = $state.Failed
+            $result.Sync = & $run 'Sync' { Invoke-ICTSync -TimeoutSeconds $Config.SyncTimeoutSeconds -OnProgress $OnProgress -WhatIf:$preview -Confirm:$false }
+            $escalate = [bool]$Config.EscalateSyncToReEnroll
+            if ($preview -and $escalate) {
+                $steps.Add((New-ICTStep 'Escalate' Info ('if no check-in within {0} s: remove and re-create the enrollment' -f $Config.SyncTimeoutSeconds)))
             }
-
-            if ($enrollmentAction -eq 'Sync') {
-                try {
-                    $sync = Invoke-ICTSync -TimeoutSeconds $Config.SyncTimeoutSeconds -WhatIf:$preview -Confirm:$false
-                    $result.Sync = $sync
-                    foreach ($step in @($sync.Steps)) { $steps.Add($step) }
-                    if (-not $preview) {
-                        $result.ChangesMade = $true
-                        if (-not $sync.Succeeded) {
-                            $steps.Add((New-ICTStep -Name 'Escalate' -Status Info -Detail 'the sync did not help, re-enrolling'))
-                            $enrollmentAction = 'ReEnroll'
-                        }
-                    }
-                }
-                catch {
-                    $steps.Add((New-ICTStep -Name 'Sync' -Status Fail -Detail $_.Exception.Message))
-                    $enrollmentAction = 'ReEnroll'
-                }
-            }
-
-            if ($enrollmentAction -eq 'ReEnroll') {
-                try {
-                    $reEnrollment = Invoke-ICTReEnrollment -Method $Method -TimeoutSeconds $Config.EnrollmentTimeoutSeconds `
-                        -SkipPrerequisiteCheck:$Force -WhatIf:$preview -Confirm:$false
-                    $result.ReEnrollment = $reEnrollment
-                    foreach ($step in @($reEnrollment.Steps)) { $steps.Add($step) }
-                    if ($reEnrollment.Status -eq 'Blocked') { $blocked = $true; $result.Blockers = @($reEnrollment.Message) }
-                    elseif (-not $preview) {
-                        if ($reEnrollment.Status -ne 'Failed' -or $reEnrollment.BackupPath) { $result.ChangesMade = $true }
-                        if (-not $reEnrollment.Succeeded) { $failed = $true }
-                    }
-                }
-                catch {
-                    $steps.Add((New-ICTStep -Name 'Re-enroll' -Status Fail -Detail $_.Exception.Message))
-                    $failed = $true
-                }
+            elseif (-not $preview -and -not ($result.Sync -and $result.Sync.Succeeded) -and $escalate) {
+                $state.Failed = $failedBeforeSync   # the sync failure is superseded by the re-enrollment result
+                $steps.Add((New-ICTStep 'Escalate' Info 'the sync did not help, re-enrolling'))
+                & $reEnroll
             }
         }
     }
+    elseif ($enrollmentAction -eq 'ReEnroll') { & $reEnroll }
 
-    if ($actions -contains 'LapsRetry') {
-        try {
-            $laps = Invoke-ICTLapsRetry -WhatIf:$preview -Confirm:$false
-            $result.LapsRetry = $laps
-            foreach ($step in @($laps.Steps)) { $steps.Add($step) }
-            if (-not $preview) {
-                $result.ChangesMade = $true
-                if (-not $laps.Succeeded) { $failed = $true }
-            }
-        }
-        catch {
-            $steps.Add((New-ICTStep -Name 'LAPS retry' -Status Fail -Detail $_.Exception.Message))
-            $failed = $true
-        }
-    }
+    if ($actions -contains 'LapsRetry') { $result.LapsRetry = & $run 'LAPS retry' { Invoke-ICTLapsRetry -WhatIf:$preview -Confirm:$false } }
 
-    if ($blocked) { $result.Status = 'Blocked' }
-    elseif ($preview) { $result.Status = 'WhatIf' }
-    elseif ($failed) { $result.Status = 'Failed' }
-    else { $result.Status = 'Succeeded' }
-
+    $result.ChangesMade = $state.Changed
+    $result.Status = $(if ($state.Failed) { 'Failed' } elseif ($state.Blocked) { 'Blocked' } elseif ($preview) { 'WhatIf' } else { 'Succeeded' })
     $result.Steps = $steps.ToArray()
     return $result
 }

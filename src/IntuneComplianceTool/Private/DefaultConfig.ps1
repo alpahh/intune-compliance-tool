@@ -1,9 +1,10 @@
-# Default settings. Kept as an embedded JSON string (not a separate file) so the
-# single-file build stays one file. Override any key with -ConfigPath <file.json>.
+# Default settings, embedded so the single-file build stays one file.
+# Override any key with -ConfigPath <file.json>.
 
 $script:ICTDefaultConfigJson = @'
 {
   "MinimumOSBuild": 19045,
+  "MinimumOSRevision": {},
   "RequireBitLocker": true,
   "RequireTpm": true,
   "RequireSecureBoot": true,
@@ -16,6 +17,7 @@ $script:ICTDefaultConfigJson = @'
   "RequiredServices": ["dmwappushservice"],
   "RecommendedServices": ["IntuneManagementExtension"],
   "MdmEventLookbackDays": 7,
+  "MaxUptimeDays": 30,
 
   "Endpoints": [
     "login.microsoftonline.com",
@@ -26,6 +28,8 @@ $script:ICTDefaultConfigJson = @'
   ],
   "EndpointPort": 443,
   "EndpointTimeoutMs": 5000,
+  "ClockReferenceUri": "https://login.microsoftonline.com/",
+  "MaxClockSkewSeconds": 300,
 
   "RequireLaps": true,
   "LapsExpectedAccount": "masteruser",
@@ -34,7 +38,9 @@ $script:ICTDefaultConfigJson = @'
   "LapsSuccessEventIds": [10004, 10029],
 
   "EnrollmentMethod": "UserCredential",
-  "EnrollmentTimeoutSeconds": 300,
-  "SyncTimeoutSeconds": 180
+  "EscalateSyncToReEnroll": true,
+  "SyncTimeoutSeconds": 180,
+  "RepairScriptTimeoutSeconds": 240,
+  "EnrollmentTimeoutSeconds": 300
 }
 '@

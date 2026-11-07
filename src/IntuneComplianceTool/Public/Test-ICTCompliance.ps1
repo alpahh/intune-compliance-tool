@@ -3,7 +3,7 @@ function Test-ICTCompliance {
     .SYNOPSIS
         Evaluates collected device data against the compliance and enrollment-health rules.
     .DESCRIPTION
-        Pure evaluation: it reads the object from Get-ICTDeviceData and changes nothing.
+        Pure evaluation of the object from Get-ICTDeviceData.
 
         OverallStatus
           EnrollmentBroken  an enrollment check failed (the device does not reach Intune properly)
@@ -11,8 +11,9 @@ function Test-ICTCompliance {
           Indeterminate     nothing failed, but some data could not be read
           Compliant         no failures and no unknowns (warnings and info are allowed)
 
-        RecommendedActions: any of Sync, ReEnroll (exclusive with Sync), LapsRetry.
-        Blockers: findings that make an automatic enrollment repair pointless.
+        RecommendedActions, in the order -Remediate runs them:
+          TimeSync, ServiceFix, Sync or ReEnroll, LapsRetry
+        ReEnrollBlockers / SyncBlockers: findings that make that repair pointless.
     #>
     [CmdletBinding()]
     param(
@@ -26,44 +27,47 @@ function Test-ICTCompliance {
         $utcNow = $Now.ToUniversalTime()
 
         $results = @(
-            Get-ICTJoinRule -DeviceData $DeviceData
+            Get-ICTJoinRule -DeviceData $DeviceData -Now $utcNow
             Get-ICTEnrollmentRule -DeviceData $DeviceData -Config $Config -Now $utcNow
             Get-ICTHealthRule -DeviceData $DeviceData -Config $Config -Now $utcNow
-            Get-ICTNetworkRule -DeviceData $DeviceData
+            Get-ICTNetworkRule -DeviceData $DeviceData -Config $Config
             Get-ICTSecurityRule -DeviceData $DeviceData -Config $Config
             Get-ICTLapsRule -DeviceData $DeviceData -Config $Config -Now $utcNow
-        ) | Where-Object { $_ }
-        $results = @($results)
+        )
 
-        $failed = @($results | Where-Object { $_.Status -eq 'Fail' })
-        $actions = New-Object 'System.Collections.Generic.List[string]'
-        if ($failed | Where-Object { $_.Action -eq 'ReEnroll' }) { $actions.Add('ReEnroll') }
-        elseif ($failed | Where-Object { $_.Action -eq 'Sync' }) { $actions.Add('Sync') }
-        if ($failed | Where-Object { $_.Action -eq 'LapsRetry' }) { $actions.Add('LapsRetry') }
+        $wanted = @($results | Where-Object { $_.Action } | ForEach-Object { $_.Action } | Sort-Object -Unique)
+        if ($wanted -contains 'ReEnroll') { $wanted = @($wanted | Where-Object { $_ -ne 'Sync' }) }
+        $actions = @('TimeSync', 'ServiceFix', 'ReEnroll', 'Sync', 'LapsRetry' | Where-Object { $wanted -contains $_ })
 
-        $enrollmentBroken = ($actions.Contains('ReEnroll') -or $actions.Contains('Sync'))
-        $blockers = @($results | Where-Object { $_.BlocksRemediation -and ($_.Status -eq 'Fail' -or $_.Status -eq 'Warning') } |
-                ForEach-Object { '{0}: {1}' -f $_.Name, $_.Actual })
-        if ($DeviceData.IsElevated -eq $false) { $blockers += 'Session: not running as administrator' }
-
-        $status = 'Compliant'
-        if ($enrollmentBroken) { $status = 'EnrollmentBroken' }
-        elseif ($failed.Count -gt 0) { $status = 'NonCompliant' }
-        elseif ($results | Where-Object { $_.Status -eq 'Unknown' }) { $status = 'Indeterminate' }
-
-        $summary = [ordered]@{}
-        foreach ($name in 'Pass', 'Fail', 'Warning', 'Unknown', 'Info') {
-            $summary[$name] = @($results | Where-Object { $_.Status -eq $name }).Count
+        $describe = { '{0}: {1}' -f $_.Name, $_.Actual }
+        $syncBlockers = @($results | Where-Object { $_.Blocks -eq 'All' } | ForEach-Object $describe)
+        $reEnrollBlockers = @($results | Where-Object { $_.Blocks } | ForEach-Object $describe)
+        if ($DeviceData.IsElevated -eq $false) {
+            $syncBlockers += 'Session: not running as administrator'
+            $reEnrollBlockers += 'Session: not running as administrator'
         }
 
+        $enrollmentAction = @($actions | Where-Object { $_ -eq 'ReEnroll' -or $_ -eq 'Sync' }) | Select-Object -First 1
+        $blockers = $(if ($enrollmentAction -eq 'Sync') { $syncBlockers } else { $reEnrollBlockers })
+
+        $status = 'Compliant'
+        if ($enrollmentAction) { $status = 'EnrollmentBroken' }
+        elseif (@($results | Where-Object { $_.Status -eq 'Fail' }).Count -gt 0) { $status = 'NonCompliant' }
+        elseif (@($results | Where-Object { $_.Status -eq 'Unknown' }).Count -gt 0) { $status = 'Indeterminate' }
+
+        $summary = [ordered]@{}
+        foreach ($name in 'Pass', 'Fail', 'Warning', 'Unknown', 'Info') { $summary[$name] = @($results | Where-Object { $_.Status -eq $name }).Count }
+
         [pscustomobject]@{
-            EvaluatedAt              = ConvertTo-ICTIsoDate $utcNow
-            OverallStatus            = $status
-            RecommendedActions       = $actions.ToArray()
-            CanRepairEnrollment      = ($enrollmentBroken -and $blockers.Count -eq 0)
-            Blockers                 = $blockers
-            Summary                  = [pscustomobject]$summary
-            Results                  = $results
+            EvaluatedAt         = ConvertTo-ICTIsoDate $utcNow
+            OverallStatus       = $status
+            RecommendedActions  = $actions
+            CanRepairEnrollment = ([bool]$enrollmentAction -and @($blockers).Count -eq 0)
+            Blockers            = @($(if ($enrollmentAction) { $blockers }))
+            ReEnrollBlockers    = $reEnrollBlockers
+            SyncBlockers        = $syncBlockers
+            Summary             = [pscustomobject]$summary
+            Results             = $results
         }
     }
 }

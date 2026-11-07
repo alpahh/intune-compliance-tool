@@ -47,8 +47,8 @@ function Format-ICTReport {
     $padLeft = [int][math]::Floor(($badgeInner - $badge.Text.Length) / 2)
     $badgeText = (' ' * $padLeft) + $badge.Text + (' ' * ($badgeInner - $badge.Text.Length - $padLeft))
 
-    $actionNames = @{ ReEnroll = 'RE-ENROLL'; Sync = 'SYNC'; LapsRetry = 'LAPS RETRY' }
-    $actions = @($evaluation.RecommendedActions | ForEach-Object { $actionNames[$_] })
+    $actionNames = @{ TimeSync = 'CLOCK'; ServiceFix = 'SERVICES'; ReEnroll = 'RE-ENROLL'; Sync = 'SYNC'; LapsRetry = 'LAPS RETRY' }
+    $actions = @($evaluation.RecommendedActions | ForEach-Object { $actionNames[$_] } | Where-Object { $_ })
     $sideWidth = $Width - $badgeInner - 7
     $recommended = 'Recommended: ' + $(if ($actions.Count -gt 0) { $actions -join ' + ' } else { 'nothing' })
     $repairText = ''
@@ -84,7 +84,7 @@ function Format-ICTReport {
     }
     $joinText = ''
     if ($join) {
-        $joinText = @{ EntraJoined = 'Entra joined'; HybridJoined = 'Hybrid joined'; DomainJoinedOnly = 'Domain only'; WorkplaceJoined = 'Workplace only'; NotJoined = 'Not joined' }[$join.JoinType]
+        $joinText = $script:ICTJoinText[$join.JoinType]
         if ($join.TenantName) { $joinText = '{0} {1} {2}' -f $joinText, $s.Dot, $join.TenantName }
     }
     $sshUser = "$($data.RunAs)"
@@ -161,7 +161,7 @@ function Format-ICTReport {
     #region Detailed event list
     if ($Detailed -and $data.MdmEvents -and @($data.MdmEvents.Recent).Count -gt 0) {
         $lines.Add('')
-        $lines.Add('  ' + (& $color ('RECENT MDM ERRORS (last {0} days)' -f $data.MdmEvents.LookbackDays) 'Bold'))
+        $lines.Add('  ' + (& $color ('RECENT MDM ERRORS (latest of the last {0} days)' -f $data.MdmEvents.LookbackDays) 'Bold'))
         foreach ($event in @($data.MdmEvents.Recent)) {
             $when = (Format-ICTRelativeTime $event.TimeCreated -Now $utcNow).PadRight(12)
             $text = Limit-ICTText -Text ('{0}  {1}' -f $event.Id, $event.Message) -Width ($Width - 4 - 12) -Theme $theme
@@ -211,20 +211,27 @@ function Format-ICTReport {
     $remediationStatus = $(if ($remediation) { $remediation.Status } else { $null })
     $backupPath = $(if ($remediation -and $remediation.ReEnrollment) { $remediation.ReEnrollment.BackupPath } else { $null })
 
+    $addBlockers = {
+        param([string]$Title, [object[]]$Items)
+        $next.Add($Title)
+        foreach ($blocker in @($Items)) { $next.Add("  $($s.Dot) $blocker") }
+    }
+    $selfBlocked = ($remediation -and $remediation.ReEnrollment -and $remediation.ReEnrollment.Status -eq 'Blocked')
+
     switch ($remediationStatus) {
-        'WhatIf' {
-            $next.Add("This was a preview. To apply it: $CommandHint -Remediate")
-        }
+        'WhatIf' { $next.Add("This was a preview. To apply it: $CommandHint -Remediate") }
         'Blocked' {
-            $next.Add('The enrollment repair was not started because of:')
-            foreach ($blocker in @($remediation.Blockers)) { $next.Add("  $($s.Dot) $blocker") }
-            $next.Add("Fix these first, or force it with: $CommandHint -Remediate -Force")
+            & $addBlockers 'The enrollment repair was not started because of:' $remediation.Blockers
+            if (-not $selfBlocked) { $next.Add("Fix these first, or try anyway with: $CommandHint -Remediate -Force") }
         }
         'Failed' {
             $next.Add('The repair did not complete.')
-            foreach ($part in @($remediation.Sync, $remediation.ReEnrollment, $remediation.LapsRetry)) {
-                if ($part -and $part.Message -and -not $part.Succeeded) { $next.Add($part.Message) }
+            $parts = @($remediation.ReEnrollment, $remediation.LapsRetry)
+            if (-not $remediation.ReEnrollment) { $parts += $remediation.Sync }   # after an escalation the sync result no longer matters
+            foreach ($part in $parts) {
+                if ($part -and $part.Message -and -not $part.Succeeded -and $part.Status -ne 'Blocked') { $next.Add($part.Message) }
             }
+            if (@($remediation.Blockers).Count -gt 0) { & $addBlockers 'Not started because of:' $remediation.Blockers }
             if ($backupPath) { $next.Add("Backup of the removed enrollment: $backupPath") }
         }
         'Succeeded' {
@@ -235,17 +242,18 @@ function Format-ICTReport {
     }
 
     if (-not $remediationStatus -or $remediationStatus -eq 'NothingToDo' -or ($remediationStatus -eq 'Succeeded' -and $evaluation.OverallStatus -ne 'Compliant')) {
+        $actions = @($evaluation.RecommendedActions)
         switch ($evaluation.OverallStatus) {
             'EnrollmentBroken' {
                 $broken = @($failed | Where-Object { $_.Action -eq 'ReEnroll' -or $_.Action -eq 'Sync' } | ForEach-Object { $_.Name })
                 $next.Add('The Intune connection is broken (' + ($broken -join ', ') + ').')
                 if ($evaluation.CanRepairEnrollment) {
-                    $next.Add("Preview the repair:  $CommandHint -Remediate -WhatIf")
-                    $next.Add("Repair:              $CommandHint -Remediate")
+                    $next.Add("Preview the repair: $CommandHint -Remediate -WhatIf")
+                    $next.Add("Repair: $CommandHint -Remediate")
                 }
                 else {
-                    $next.Add('Automatic repair is blocked by:')
-                    foreach ($blocker in @($evaluation.Blockers)) { $next.Add("  $($s.Dot) $blocker") }
+                    & $addBlockers 'Automatic repair is blocked by:' $evaluation.Blockers
+                    $next.Add("Fix these first, or try anyway with: $CommandHint -Remediate -Force")
                 }
             }
             'NonCompliant' {
@@ -256,10 +264,11 @@ function Format-ICTReport {
                 $unknown = @($evaluation.Results | Where-Object { $_.Status -eq 'Unknown' } | ForEach-Object { $_.Name })
                 $next.Add('Some data could not be read: ' + ($unknown -join ', ') + '.')
             }
-            'Compliant' { $next.Add('Nothing to do.') }
+            'Compliant' { if (@($actions | Where-Object { $_ -ne 'LapsRetry' }).Count -eq 0) { $next.Add('Nothing to do.') } }
         }
-        if (@($evaluation.RecommendedActions) -contains 'LapsRetry') {
-            $next.Add("LAPS has a problem: $CommandHint -Remediate also retries LAPS processing.")
+        $quickFixes = @(@{ TimeSync = 'clock'; ServiceFix = 'services'; LapsRetry = 'LAPS' }.GetEnumerator() | Where-Object { $actions -contains $_.Key } | ForEach-Object { $_.Value } | Sort-Object)
+        if ($quickFixes.Count -gt 0 -and $evaluation.OverallStatus -ne 'EnrollmentBroken') {
+            $next.Add(('Repairable here ({0}): {1} -Remediate' -f ($quickFixes -join ', '), $CommandHint))
         }
         if (-not $Detailed -and ($failed.Count -gt 0 -or $evaluation.Summary.Warning -gt 0)) {
             $next.Add("Reasons and fixes for each finding: $CommandHint -Detailed")
@@ -271,7 +280,8 @@ function Format-ICTReport {
     $lines.Add('  ' + (& $color 'NEXT STEPS' 'Bold'))
     foreach ($item in $next) {
         if ($item.StartsWith('  ')) {
-            $lines.Add('      ' + (Limit-ICTText -Text $item.Trim() -Width ($Width - 6) -Theme $theme))
+            $wrappedBullet = @(Split-ICTText -Text $item.Trim() -Width ($Width - 8))
+            for ($i = 0; $i -lt $wrappedBullet.Count; $i++) { $lines.Add($(if ($i -eq 0) { '      ' } else { '        ' }) + $wrappedBullet[$i]) }
             continue
         }
         $wrapped = @(Split-ICTText -Text $item -Width ($Width - 6))
