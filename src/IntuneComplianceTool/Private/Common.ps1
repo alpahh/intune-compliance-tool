@@ -1,10 +1,12 @@
 # Shared constants and helpers. Everything in this file is platform-neutral so it
 # can be unit tested on any OS.
 
-$script:ICTVersion = '0.1.0'
+$script:ICTVersion = '0.2.0'
 $script:ICTIntuneProviderId = 'MS DM Server'
 $script:ICTGuidPattern = '^\{?[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}?$'
 $script:ICTLogPath = $null
+$script:ICTInvariant = [System.Globalization.CultureInfo]::InvariantCulture
+$script:ICTJoinText = @{ EntraJoined = 'Entra joined'; HybridJoined = 'Hybrid joined'; DomainJoinedOnly = 'Domain joined only'; WorkplaceJoined = 'Workplace registered only'; NotJoined = 'Not joined' }
 
 function Test-ICTIsWindows {
     [CmdletBinding()]
@@ -131,7 +133,7 @@ function Write-ICTLog {
     Write-Verbose ('[{0}] {1}' -f $Level, $Message)
 
     if ($script:ICTLogPath) {
-        $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level.ToUpperInvariant(), $Message
+        $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', $script:ICTInvariant), $Level.ToUpperInvariant(), $Message
         try {
             # Logging must happen even inside -WhatIf runs.
             Add-Content -LiteralPath $script:ICTLogPath -Value $line -Encoding UTF8 -ErrorAction Stop -WhatIf:$false -Confirm:$false
@@ -146,10 +148,13 @@ function Invoke-ICTCollector {
     <#
         Runs one collection step. A failure is logged and recorded in ErrorList
         instead of aborting the whole collection. On failure nothing is written to
-        the pipeline, so callers get $null (or an empty array when wrapped in @()).
+        the pipeline, so the caller gets $null. List-type sections return their
+        result as ", @(...)" so that "nothing found" (empty array) and "could not
+        read" ($null) stay distinguishable.
     #>
     [CmdletBinding()]
     param(
+        [string]$Group,
         [Parameter(Mandatory)][string]$Section,
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
         [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$ErrorList
@@ -160,8 +165,29 @@ function Invoke-ICTCollector {
     }
     catch {
         Write-ICTLog -Level Warning -Message "Collecting '$Section' failed: $($_.Exception.Message)"
-        $ErrorList.Add([pscustomobject]@{ Section = $Section; Error = $_.Exception.Message })
+        $ErrorList.Add([pscustomobject]@{ Group = $Group; Section = $Section; Error = $_.Exception.Message })
     }
+}
+
+function New-ICTEventXPath {
+    <# XPath filter for Get-WinEvent: any of the levels or event IDs, within the last N days. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([int[]]$Level = @(), [int[]]$EventId = @(), [Parameter(Mandatory)][int]$Days)
+    $conditions = @($Level | ForEach-Object { "Level=$_" }) + @($EventId | ForEach-Object { "EventID=$_" })
+    return '*[System[({0}) and TimeCreated[timediff(@SystemTime) <= {1}]]]' -f ($conditions -join ' or '), ([int64]$Days * 86400000)
+}
+
+function Get-ICTHttpProxyAddress {
+    <# The proxy to use for HTTPS from a WinHTTP proxy setting ("host:port" or "http=...;https=..."). #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][psobject]$Proxy)
+    if (-not $Proxy -or -not $Proxy.ProxyConfigured -or -not $Proxy.ProxyServer) { return $null }
+    $server = [string]$Proxy.ProxyServer
+    if ($server -match '(^|;)https=(?<p>[^;]+)') { return $Matches['p'] }
+    if ($server -notmatch '=') { return ($server -split ';')[0] }
+    return $null
 }
 
 function Get-ICTEnrollmentRegistryPath {
@@ -209,12 +235,12 @@ function Format-ICTRelativeTime {
 }
 
 function New-ICTStep {
-    <# One line of a repair log. Status: Pass | Fail | Warning | Info | Skipped #>
+    <# One line of a repair log. Status: Pass | Fail | Warning | Info #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][ValidateSet('Pass', 'Fail', 'Warning', 'Info', 'Skipped')][string]$Status,
-        [string]$Detail
+        [Parameter(Mandatory, Position = 0)][string]$Name,
+        [Parameter(Mandatory, Position = 1)][ValidateSet('Pass', 'Fail', 'Warning', 'Info')][string]$Status,
+        [Parameter(Position = 2)][string]$Detail
     )
     $level = $(if ($Status -eq 'Fail') { 'Error' } elseif ($Status -eq 'Warning') { 'Warning' } else { 'Info' })
     Write-ICTLog -Level $level -Message ('{0} [{1}] {2}' -f $Name, $Status, $Detail)

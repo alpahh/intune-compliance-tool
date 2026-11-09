@@ -1,55 +1,46 @@
 function ConvertFrom-ICTDsregOutput {
     <#
-        Parses the text output of "dsregcmd /status" into an object. dsregcmd field
-        names are not localised, so this works on any Windows display language.
-        When a field appears in more than one section, the first occurrence wins.
+        Parses "dsregcmd /status" output. Field names are not localised, so this works
+        on any display language. When a field appears in several sections, the first
+        occurrence wins. User-specific fields (SSO state, PRT) are ignored on purpose:
+        over SSH they describe the SSH account, not the person at the device.
     #>
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [AllowEmptyString()]
-        [string[]]$Line
-    )
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Line)
 
     $values = @{}
     foreach ($text in $Line) {
         if ($text -match '^\s*(?<key>[A-Za-z][A-Za-z0-9 \-\.]*?)\s+:\s*(?<value>.*?)\s*$') {
             $key = $Matches['key'] -replace '\s', ''
-            if (-not $values.ContainsKey($key)) {
-                $value = $Matches['value']
-                if ($value -eq '') { $value = $null }
-                $values[$key] = $value
-            }
+            if (-not $values.ContainsKey($key) -and $Matches['value'] -ne '') { $values[$key] = $Matches['value'] }
         }
     }
 
     $azureAdJoined = ConvertFrom-ICTYesNo $values['AzureAdJoined']
     $domainJoined = ConvertFrom-ICTYesNo $values['DomainJoined']
-    $workplaceJoined = ConvertFrom-ICTYesNo $values['WorkplaceJoined']
-
     $joinType = 'NotJoined'
     if ($azureAdJoined -and $domainJoined) { $joinType = 'HybridJoined' }
     elseif ($azureAdJoined) { $joinType = 'EntraJoined' }
     elseif ($domainJoined) { $joinType = 'DomainJoinedOnly' }
-    elseif ($workplaceJoined) { $joinType = 'WorkplaceJoined' }
+    elseif (ConvertFrom-ICTYesNo $values['WorkplaceJoined']) { $joinType = 'WorkplaceJoined' }
+
+    # "[ 2025-01-10 08:00:00.000 UTC -- 2035-01-10 08:30:00.000 UTC ]"
+    $certificateNotAfter = $null
+    if ($values['DeviceCertificateValidity'] -match '--\s*(?<to>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
+        $certificateNotAfter = ConvertTo-ICTIsoDate $Matches['to']
+    }
 
     return [pscustomobject]@{
         JoinType                  = $joinType
         AzureAdJoined             = $azureAdJoined
         DomainJoined              = $domainJoined
-        WorkplaceJoined           = $workplaceJoined
-        EnterpriseJoined          = ConvertFrom-ICTYesNo $values['EnterpriseJoined']
         DeviceName                = $values['DeviceName']
         DeviceId                  = $values['DeviceId']
         DeviceAuthStatus          = $values['DeviceAuthStatus']
-        DeviceCertificateValidity = $values['DeviceCertificateValidity']
-        TpmProtected              = ConvertFrom-ICTYesNo $values['TpmProtected']
+        DeviceCertificateNotAfter = $certificateNotAfter
+        KeySignTest               = $values['KeySignTest']
         TenantName                = $values['TenantName']
         TenantId                  = $values['TenantId']
-        DomainName                = $values['DomainName']
         MdmUrl                    = $values['MdmUrl']
-        MdmComplianceUrl          = $values['MdmComplianceUrl']
-        AzureAdPrt                = ConvertFrom-ICTYesNo $values['AzureAdPrt']
     }
 }

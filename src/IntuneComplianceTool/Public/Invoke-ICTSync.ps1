@@ -3,82 +3,74 @@ function Invoke-ICTSync {
     .SYNOPSIS
         Starts an Intune MDM sync and waits for a successful check-in.
     .DESCRIPTION
-        Starts the PushLaunch scheduled task of every Intune enrollment, then polls the
-        OMA-DM "last successful session" time until it moves forward or the timeout
-        passes. Changes nothing else; the lightest possible repair.
+        Starts the PushLaunch task of every Intune enrollment, then polls until the
+        last successful OMA-DM session moves forward. On devices that do not record
+        that time, a newer successful run of the enrollment's tasks counts instead
+        (the same fallback the Last check-in rule uses).
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
         [ValidateRange(0, 3600)][int]$TimeoutSeconds = 180,
-        [ValidateRange(1, 300)][int]$PollIntervalSeconds = 15
+        [ValidateRange(1, 300)][int]$PollIntervalSeconds = 5,
+        [scriptblock]$OnProgress
     )
 
     if (-not (Test-ICTIsWindows)) { throw 'Invoke-ICTSync must run on Windows.' }
 
     $steps = New-Object 'System.Collections.Generic.List[object]'
-    $result = [pscustomobject]@{
-        Action            = 'Sync'
-        Status            = 'NotStarted'
-        Succeeded         = $false
-        EnrollmentIds     = @()
-        LastSuccessBefore = $null
-        LastSuccessAfter  = $null
-        Message           = $null
-        Steps             = $null
+    $result = [pscustomobject]@{ Status = 'NotStarted'; Succeeded = $false; LastSuccessBefore = $null; LastSuccessAfter = $null; Message = $null; Steps = $null }
+    $finish = {
+        param([string]$Status, [string]$Message)
+        $result.Status = $Status
+        if ($Message) { $result.Message = $Message }
+        $result.Steps = $steps.ToArray()
+        return $result
     }
 
     $ids = @(Get-ICTEnrollmentRegistry | Where-Object { $_.IsIntune } | ForEach-Object { $_.EnrollmentId })
-    $result.EnrollmentIds = $ids
     if ($ids.Count -eq 0) {
-        $result.Status = 'NoEnrollment'
-        $result.Message = 'No Intune enrollment exists, so there is nothing to sync.'
-        $steps.Add((New-ICTStep -Name 'Sync' -Status Fail -Detail 'no Intune enrollment'))
-        $result.Steps = $steps.ToArray()
-        return $result
+        $steps.Add((New-ICTStep 'Sync' Fail 'no Intune enrollment'))
+        return (& $finish 'NoEnrollment' 'No Intune enrollment exists, so there is nothing to sync.')
     }
 
     $before = Get-ICTLatestServerSuccess -EnrollmentId $ids
     $result.LastSuccessBefore = ConvertTo-ICTIsoDate $before
 
-    if (-not $PSCmdlet.ShouldProcess([System.Environment]::MachineName, 'Start an Intune sync (PushLaunch task)')) {
-        $result.Status = 'WhatIf'
-        $steps.Add((New-ICTStep -Name 'Sync' -Status Info -Detail ('would start PushLaunch and wait up to {0} s' -f $TimeoutSeconds)))
-        $result.Steps = $steps.ToArray()
-        return $result
+    if ($WhatIfPreference -or -not $PSCmdlet.ShouldProcess([System.Environment]::MachineName, 'Start an Intune sync (PushLaunch task)')) {
+        $steps.Add((New-ICTStep 'Sync' Info ('would start PushLaunch and wait up to {0} s' -f $TimeoutSeconds)))
+        return (& $finish 'WhatIf' $null)
     }
 
-    $started = 0
-    foreach ($id in $ids) {
-        if (Start-ICTEnterpriseMgmtSyncTask -EnrollmentId $id) { $started++ }
+    $started = [datetime]::UtcNow
+    $launched = @($ids | Where-Object { Start-ICTEnterpriseMgmtSyncTask -EnrollmentId $_ }).Count
+    if ($launched -eq 0) {
+        $steps.Add((New-ICTStep 'Start sync' Fail 'PushLaunch task not found'))
+        return (& $finish 'Failed' 'The PushLaunch task does not exist, so a sync cannot be started.')
     }
-    if ($started -eq 0) {
-        $result.Status = 'Failed'
-        $result.Message = 'The PushLaunch task does not exist, so a sync cannot be started.'
-        $steps.Add((New-ICTStep -Name 'Start sync' -Status Fail -Detail 'PushLaunch task not found'))
-        $result.Steps = $steps.ToArray()
-        return $result
-    }
-    $steps.Add((New-ICTStep -Name 'Start sync' -Status Pass -Detail 'PushLaunch task started'))
+    $steps.Add((New-ICTStep 'Start sync' Pass 'PushLaunch task started'))
 
     $attempts = [int][math]::Ceiling($TimeoutSeconds / $PollIntervalSeconds)
-    $waited = 0
-    for ($i = 0; $i -lt $attempts; $i++) {
+    for ($i = 1; $i -le $attempts; $i++) {
         Start-Sleep -Seconds $PollIntervalSeconds
-        $waited += $PollIntervalSeconds
+        $waited = $i * $PollIntervalSeconds
+        if ($OnProgress) { & $OnProgress ('waiting for a successful check-in ({0} s)' -f $waited) }
+
         $after = Get-ICTLatestServerSuccess -EnrollmentId $ids
-        if ($after -and ($null -eq $before -or $after -gt $before)) {
+        $success = ($after -and ($null -eq $before -or $after -gt $before))
+        if (-not $success -and $null -eq $before) {
+            # No server success time on this device: accept a newer successful task run.
+            $success = [bool](@(Get-ICTEnterpriseMgmtTask | Where-Object {
+                        $ids -contains $_.EnrollmentId -and $_.TaskName -ne 'PushLaunch' -and $_.LastTaskResult -eq 0 -and (ConvertFrom-ICTDate $_.LastRunTime) -gt $started
+                    }).Count)
+        }
+        if ($success) {
             $result.LastSuccessAfter = ConvertTo-ICTIsoDate $after
-            $result.Status = 'Succeeded'
             $result.Succeeded = $true
-            $steps.Add((New-ICTStep -Name 'Check-in' -Status Pass -Detail ('succeeded after {0} s' -f $waited)))
-            $result.Steps = $steps.ToArray()
-            return $result
+            $steps.Add((New-ICTStep 'Check-in' Pass ('succeeded after {0} s' -f $waited)))
+            return (& $finish 'Succeeded' $null)
         }
     }
 
-    $result.Status = 'TimedOut'
-    $result.Message = 'The sync was started, but no successful check-in was recorded in time.'
-    $steps.Add((New-ICTStep -Name 'Check-in' -Status Fail -Detail ('no successful check-in within {0} s' -f $TimeoutSeconds)))
-    $result.Steps = $steps.ToArray()
-    return $result
+    $steps.Add((New-ICTStep 'Check-in' Fail ('no successful check-in within {0} s' -f $TimeoutSeconds)))
+    return (& $finish 'TimedOut' 'The sync was started, but no successful check-in was recorded in time.')
 }

@@ -1,82 +1,101 @@
+$script:ICTRuleCategory = @{ JOIN = 'Join'; ENR = 'Enrollment'; SVC = 'Health'; EVT = 'Health'; HLT = 'Health'; NET = 'Network'; SEC = 'Security'; LAPS = 'LAPS' }
+
+# Auto-enrollment error codes (event 76) worth explaining. Blocks = re-enrolling would fail the same way.
+$script:ICTEnrollErrors = @{
+    '0x8018002b' = @{ Text = 'user not in MDM scope or UPN domain not verified'; Blocks = $true }
+    '0x80180018' = @{ Text = 'user has no Intune license'; Blocks = $true }
+    '0x80180014' = @{ Text = 'blocked by enrollment restrictions'; Blocks = $true }
+    '0x8018000a' = @{ Text = 'device already enrolled'; Blocks = $false }
+    '0x80192ee7' = @{ Text = 'server name could not be resolved'; Blocks = $false }
+    '0x80192ee2' = @{ Text = 'connection timed out'; Blocks = $false }
+}
+
 function New-ICTRuleResult {
     <#
-        One check result.
+        One check result. The category comes from the Id prefix.
         Status: Pass | Fail | Warning | Unknown | Info
-        Action: what fixes a Fail automatically (Sync | ReEnroll | LapsRetry) or $null.
-        BlocksRemediation: this finding means an automatic enrollment repair would not work.
+        Action: the repair -Remediate runs for a Fail or Warning (TimeSync, ServiceFix, Sync, ReEnroll, LapsRetry).
+        Blocks: for a Fail or Warning, the repairs this finding makes pointless: ReEnroll, or All (sync too).
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Id,
-        [Parameter(Mandatory)][string]$Category,
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][ValidateSet('Pass', 'Fail', 'Warning', 'Unknown', 'Info')][string]$Status,
-        [string]$Actual,
+        [Parameter(Mandatory, Position = 0)][string]$Id,
+        [Parameter(Mandatory, Position = 1)][string]$Name,
+        [Parameter(Mandatory, Position = 2)][ValidateSet('Pass', 'Fail', 'Warning', 'Unknown', 'Info')][string]$Status,
+        [Parameter(Position = 3)][string]$Actual,
         [string]$Message,
         [string]$Remediation,
-        [ValidateSet('Sync', 'ReEnroll', 'LapsRetry')][string]$Action,
-        [switch]$BlocksRemediation
+        [ValidateSet('TimeSync', 'ServiceFix', 'Sync', 'ReEnroll', 'LapsRetry')][string]$Action,
+        [ValidateSet('ReEnroll', 'All')][string]$Blocks
     )
 
-    $resolvedAction = $null
-    if ($Action -and $Status -eq 'Fail') { $resolvedAction = $Action }
-
+    $isProblem = ($Status -eq 'Fail' -or $Status -eq 'Warning')
+    if ($Action -eq 'ReEnroll' -and -not $Remediation) { $Remediation = 'Re-enroll the device (this tool: -Remediate).' }
     return [pscustomobject]@{
-        Id                = $Id
-        Category          = $Category
-        Name              = $Name
-        Status            = $Status
-        Actual            = $Actual
-        Message           = $Message
-        Remediation       = $Remediation
-        Action            = $resolvedAction
-        BlocksRemediation = [bool]$BlocksRemediation
+        Id          = $Id
+        Category    = $script:ICTRuleCategory[$Id.Split('-')[0]]
+        Name        = $Name
+        Status      = $Status
+        Actual      = $Actual
+        Message     = $Message
+        Remediation = $Remediation
+        Action      = $(if ($isProblem -and $Action) { $Action } else { $null })
+        Blocks      = $(if ($isProblem -and $Blocks) { $Blocks } else { $null })
     }
+}
+
+function Format-ICTDate {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][object]$Date)
+    $value = ConvertFrom-ICTDate $Date
+    if ($null -eq $value) { return 'unknown' }
+    return $value.ToString('yyyy-MM-dd', $script:ICTInvariant)
 }
 
 function Get-ICTJoinRule {
     [CmdletBinding()]
-    param([psobject]$DeviceData)
+    param([psobject]$DeviceData, [datetime]$Now)
 
     $join = $DeviceData.Join
-    if ($null -eq $join) {
-        New-ICTRuleResult -Id 'JOIN-001' -Category 'Join' -Name 'Entra ID join' -Status Unknown -Actual 'dsregcmd data unavailable' `
-            -Message 'dsregcmd /status could not be read, so the join state is unknown.'
+    if ($null -eq $join) { New-ICTRuleResult 'JOIN-001' 'Entra ID join' Unknown 'could not read dsregcmd'; return }
+
+    $joinText = $script:ICTJoinText[$join.JoinType]
+    if ($join.JoinType -ne 'EntraJoined' -and $join.JoinType -ne 'HybridJoined') {
+        New-ICTRuleResult 'JOIN-001' 'Entra ID join' Fail $joinText -Blocks ReEnroll `
+            -Message 'The device is not Entra joined or hybrid joined, so it cannot auto-enroll into Intune.' `
+            -Remediation 'Join the device to Entra ID (or let hybrid join finish: Entra Connect sync + "dsregcmd /join" as SYSTEM).'
         return
     }
+    New-ICTRuleResult 'JOIN-001' 'Entra ID join' Pass ($(if ($join.TenantName) { "$joinText - $($join.TenantName)" } else { $joinText }))
 
-    $joinText = @{ EntraJoined = 'Entra joined'; HybridJoined = 'Hybrid joined'; DomainJoinedOnly = 'Domain joined only'; WorkplaceJoined = 'Workplace registered only'; NotJoined = 'Not joined' }[$join.JoinType]
-    $isJoined = ($join.JoinType -eq 'EntraJoined' -or $join.JoinType -eq 'HybridJoined')
-    if ($isJoined) {
-        $actual = $joinText
-        if ($join.TenantName) { $actual = "$joinText - $($join.TenantName)" }
-        New-ICTRuleResult -Id 'JOIN-001' -Category 'Join' -Name 'Entra ID join' -Status Pass -Actual $actual
+    if ($join.DeviceAuthStatus -and $join.DeviceAuthStatus -ne 'SUCCESS') {
+        New-ICTRuleResult 'JOIN-002' 'Device authentication' Fail $join.DeviceAuthStatus -Blocks ReEnroll `
+            -Message 'The device cannot authenticate to Entra ID. The device object may be deleted or disabled.' `
+            -Remediation 'Check the device in Entra ID. If it was deleted: run "dsregcmd /leave" as SYSTEM, then rejoin the device.'
     }
+    elseif ($join.DeviceAuthStatus) { New-ICTRuleResult 'JOIN-002' 'Device authentication' Pass 'SUCCESS' }
+
+    if ($join.MdmUrl) { New-ICTRuleResult 'JOIN-003' 'MDM auto-enrollment URL' Pass (Get-ICTUriHost $join.MdmUrl) }
     else {
-        $remediation = 'Join the device to Entra ID (or let hybrid join finish: Entra Connect sync + "dsregcmd /join" as SYSTEM). MDM auto-enrollment needs an Entra-joined device.'
-        New-ICTRuleResult -Id 'JOIN-001' -Category 'Join' -Name 'Entra ID join' -Status Fail -Actual $joinText -BlocksRemediation `
-            -Message 'The device is not Entra joined or hybrid joined, so it cannot auto-enroll into Intune.' -Remediation $remediation
-        return
-    }
-
-    if ($join.DeviceAuthStatus) {
-        if ($join.DeviceAuthStatus -eq 'SUCCESS') {
-            New-ICTRuleResult -Id 'JOIN-002' -Category 'Join' -Name 'Device authentication' -Status Pass -Actual 'SUCCESS'
-        }
-        else {
-            New-ICTRuleResult -Id 'JOIN-002' -Category 'Join' -Name 'Device authentication' -Status Fail -Actual $join.DeviceAuthStatus -BlocksRemediation `
-                -Message 'The device cannot authenticate to Entra ID. The device object may be deleted or disabled.' `
-                -Remediation 'Check the device in Entra ID. If it was deleted: run "dsregcmd /leave" as SYSTEM, then rejoin the device.'
-        }
-    }
-
-    if ($join.MdmUrl) {
-        New-ICTRuleResult -Id 'JOIN-003' -Category 'Join' -Name 'MDM auto-enrollment URL' -Status Pass -Actual (Get-ICTUriHost $join.MdmUrl)
-    }
-    else {
-        New-ICTRuleResult -Id 'JOIN-003' -Category 'Join' -Name 'MDM auto-enrollment URL' -Status Warning -Actual 'not set' -BlocksRemediation `
+        New-ICTRuleResult 'JOIN-003' 'MDM auto-enrollment URL' Warning 'not set' -Blocks ReEnroll `
             -Message 'dsregcmd shows no MDM URL, so automatic MDM enrollment is not configured for this device or tenant.' `
             -Remediation 'In Entra ID > Mobility (MDM and WIP) > Microsoft Intune, set the MDM user scope to include the device user.'
+    }
+
+    $notAfter = ConvertFrom-ICTDate $join.DeviceCertificateNotAfter
+    if ($join.KeySignTest -match 'FAIL') {
+        New-ICTRuleResult 'JOIN-004' 'Entra device key' Fail $join.KeySignTest -Blocks ReEnroll `
+            -Message 'The Entra device key failed its signing test (TPM or key problem), so the device cannot prove its identity.' `
+            -Remediation 'Run "dsregcmd /leave" as SYSTEM, clear the TPM if needed, then rejoin the device.'
+    }
+    elseif ($notAfter -and $notAfter -le $Now) {
+        New-ICTRuleResult 'JOIN-004' 'Entra device key' Fail ('certificate expired {0}' -f (Format-ICTDate $notAfter)) -Blocks ReEnroll `
+            -Message 'The Entra device certificate has expired.' -Remediation 'Rejoin the device to Entra ID.'
+    }
+    elseif ($notAfter) {
+        $keyText = $(if ($join.KeySignTest -match 'PASS') { ', key test passed' } else { '' })
+        New-ICTRuleResult 'JOIN-004' 'Entra device key' Pass ('certificate valid until {0}{1}' -f (Format-ICTDate $notAfter), $keyText)
     }
 }
 
@@ -84,106 +103,99 @@ function Get-ICTEnrollmentRule {
     [CmdletBinding()]
     param([psobject]$DeviceData, [psobject]$Config, [datetime]$Now)
 
+    $auto = $DeviceData.AutoEnroll
+    if ($auto -and $auto.ExternallyManaged) {
+        New-ICTRuleResult 'ENR-006' 'Managed by another MDM' Warning 'ExternallyManaged = 1' -Blocks ReEnroll `
+            -Message 'The device is flagged as managed by another MDM, so Windows refuses to auto-enroll into Intune.' `
+            -Remediation 'Remove the other MDM, then clear HKLM\SOFTWARE\Microsoft\Enrollments\ExternallyManaged.'
+    }
+
+    if ($null -eq $DeviceData.Enrollments) { New-ICTRuleResult 'ENR-001' 'Intune enrollment' Unknown 'could not read the enrollments'; return }
     $intune = @($DeviceData.Enrollments | Where-Object { $_ -and $_.IsIntune })
     if ($intune.Count -eq 0) {
-        New-ICTRuleResult -Id 'ENR-001' -Category 'Enrollment' -Name 'Intune enrollment' -Status Fail -Actual 'not enrolled' -Action ReEnroll `
-            -Message 'No Intune MDM enrollment exists on this device.' `
-            -Remediation 'Re-enroll the device (this tool: -Remediate).'
+        New-ICTRuleResult 'ENR-001' 'Intune enrollment' Fail 'not enrolled' -Action ReEnroll -Message 'No Intune MDM enrollment exists on this device.'
+        if ($auto) { Get-ICTAutoEnrollRule -AutoEnroll $auto -Now $Now }
         return
     }
-    if ($intune.Count -eq 1) {
-        New-ICTRuleResult -Id 'ENR-001' -Category 'Enrollment' -Name 'Intune enrollment' -Status Pass -Actual ('1 enrollment ({0})' -f (Get-ICTShortId $intune[0].EnrollmentId))
-    }
+    if ($intune.Count -eq 1) { New-ICTRuleResult 'ENR-001' 'Intune enrollment' Pass ('1 enrollment ({0})' -f (Get-ICTShortId $intune[0].EnrollmentId)) }
     else {
-        New-ICTRuleResult -Id 'ENR-001' -Category 'Enrollment' -Name 'Intune enrollment' -Status Warning -Actual ('{0} enrollments' -f $intune.Count) `
+        New-ICTRuleResult 'ENR-001' 'Intune enrollment' Warning ('{0} enrollments' -f $intune.Count) `
             -Message 'More than one Intune enrollment exists. Stale duplicates can stop the device from syncing.' `
             -Remediation 'If the device does not sync, reset the enrollment (-Remediate removes all Intune enrollments before re-enrolling).'
     }
 
     # Certificate: the one with the latest expiry is the active one.
-    $certificate = @($DeviceData.MdmCertificates | Where-Object { $_ } | Sort-Object NotAfter -Descending) | Select-Object -First 1
-    if ($null -eq $certificate) {
-        New-ICTRuleResult -Id 'ENR-002' -Category 'Enrollment' -Name 'MDM certificate' -Status Fail -Actual 'missing' -Action ReEnroll `
-            -Message 'The Intune MDM device certificate is missing, so the device cannot authenticate to Intune.' `
-            -Remediation 'Re-enroll the device (this tool: -Remediate).'
-    }
+    if ($null -eq $DeviceData.MdmCertificates) { New-ICTRuleResult 'ENR-002' 'MDM certificate' Unknown 'could not read the certificate store' }
     else {
+        $certificate = @($DeviceData.MdmCertificates | Where-Object { $_ } | Sort-Object NotAfter -Descending) | Select-Object -First 1
         $notAfter = ConvertFrom-ICTDate $certificate.NotAfter
-        $expiryDate = $(if ($notAfter) { $notAfter.ToString('yyyy-MM-dd') } else { 'unknown' })
-        if (-not $certificate.HasPrivateKey) {
-            New-ICTRuleResult -Id 'ENR-002' -Category 'Enrollment' -Name 'MDM certificate' -Status Fail -Actual 'private key missing' -Action ReEnroll `
-                -Message 'The MDM certificate has no private key, so the device cannot authenticate to Intune.' `
-                -Remediation 'Re-enroll the device (this tool: -Remediate).'
+        if ($null -eq $certificate) {
+            New-ICTRuleResult 'ENR-002' 'MDM certificate' Fail 'missing' -Action ReEnroll -Message 'The Intune MDM device certificate is missing, so the device cannot authenticate to Intune.'
         }
-        elseif ($null -eq $notAfter) {
-            New-ICTRuleResult -Id 'ENR-002' -Category 'Enrollment' -Name 'MDM certificate' -Status Unknown -Actual 'expiry unknown'
+        elseif (-not $certificate.HasPrivateKey) {
+            New-ICTRuleResult 'ENR-002' 'MDM certificate' Fail 'private key missing' -Action ReEnroll -Message 'The MDM certificate has no private key, so the device cannot authenticate to Intune.'
         }
+        elseif ($null -eq $notAfter) { New-ICTRuleResult 'ENR-002' 'MDM certificate' Unknown 'expiry unknown' }
         elseif ($notAfter -le $Now) {
-            New-ICTRuleResult -Id 'ENR-002' -Category 'Enrollment' -Name 'MDM certificate' -Status Fail -Action ReEnroll `
-                -Actual ('expired {0} ({1})' -f $expiryDate, (Format-ICTRelativeTime $notAfter -Now $Now)) `
-                -Message 'The Intune MDM device certificate has expired. The device can no longer check in, and the certificate cannot renew itself.' `
-                -Remediation 'Re-enroll the device (this tool: -Remediate).'
+            New-ICTRuleResult 'ENR-002' 'MDM certificate' Fail ('expired {0} ({1})' -f (Format-ICTDate $notAfter), (Format-ICTRelativeTime $notAfter -Now $Now)) -Action ReEnroll `
+                -Message 'The Intune MDM device certificate has expired. The device can no longer check in, and the certificate cannot renew itself.'
         }
-        else {
-            $daysLeft = [int][math]::Floor(($notAfter - $Now).TotalDays)
-            if ($daysLeft -lt $Config.MinCertificateDaysRemaining) {
-                New-ICTRuleResult -Id 'ENR-002' -Category 'Enrollment' -Name 'MDM certificate' -Status Warning `
-                    -Actual ('expires {0} (in {1} days)' -f $expiryDate, $daysLeft) `
-                    -Message 'The MDM certificate expires soon. It renews automatically while the device checks in regularly.' `
-                    -Remediation 'Make sure the device syncs before the expiry date.'
-            }
-            else {
-                New-ICTRuleResult -Id 'ENR-002' -Category 'Enrollment' -Name 'MDM certificate' -Status Pass -Actual ('valid until {0}' -f $expiryDate)
-            }
+        elseif (($notAfter - $Now).TotalDays -lt $Config.MinCertificateDaysRemaining) {
+            New-ICTRuleResult 'ENR-002' 'MDM certificate' Warning ('expires {0} (in {1} days)' -f (Format-ICTDate $notAfter), [int][math]::Floor(($notAfter - $Now).TotalDays)) `
+                -Message 'The MDM certificate expires soon. It renews automatically while the device checks in regularly.' -Remediation 'Make sure the device syncs before the expiry date.'
         }
+        else { New-ICTRuleResult 'ENR-002' 'MDM certificate' Pass ('valid until {0}' -f (Format-ICTDate $notAfter)) }
     }
 
     $sync = @($DeviceData.Sync | Where-Object { $_ })
-    $taskCount = 0
-    foreach ($entry in $sync) { $taskCount += [int]$entry.TaskCount }
-    if ($taskCount -eq 0) {
-        New-ICTRuleResult -Id 'ENR-003' -Category 'Enrollment' -Name 'Sync tasks' -Status Fail -Actual 'none' -Action ReEnroll `
-            -Message 'The scheduled tasks that make the device check in with Intune are missing.' `
-            -Remediation 'Re-enroll the device (this tool: -Remediate).'
-    }
+    if (@($sync | Where-Object { $null -eq $_.TaskCount }).Count -gt 0) { New-ICTRuleResult 'ENR-003' 'Sync tasks' Unknown 'could not read the scheduled tasks' }
     else {
-        New-ICTRuleResult -Id 'ENR-003' -Category 'Enrollment' -Name 'Sync tasks' -Status Pass -Actual ('{0} tasks present' -f $taskCount)
+        $taskCount = ($sync | Measure-Object -Property TaskCount -Sum).Sum
+        if (-not $taskCount) {
+            New-ICTRuleResult 'ENR-003' 'Sync tasks' Fail 'none' -Action ReEnroll -Message 'The scheduled tasks that make the device check in with Intune are missing.'
+        }
+        else { New-ICTRuleResult 'ENR-003' 'Sync tasks' Pass ('{0} tasks present' -f $taskCount) }
     }
 
     # Last successful check-in: OMA-DM server success time, else the last successful task run.
-    $lastSuccess = $null
-    $source = 'server'
-    foreach ($entry in $sync) {
-        $date = ConvertFrom-ICTDate $entry.ServerLastSuccessTime
-        if ($date -and ($null -eq $lastSuccess -or $date -gt $lastSuccess)) { $lastSuccess = $date }
+    $lastSuccess = @($sync | ForEach-Object { ConvertFrom-ICTDate $_.ServerLastSuccessTime } | Where-Object { $_ } | Sort-Object -Descending) | Select-Object -First 1
+    $suffix = ''
+    if ($null -eq $lastSuccess) {
+        $lastSuccess = @($sync | Where-Object { $_.LastTaskResult -eq 0 } | ForEach-Object { ConvertFrom-ICTDate $_.LastTaskRunTime } | Where-Object { $_ } | Sort-Object -Descending) | Select-Object -First 1
+        $suffix = ' (task run)'
     }
     if ($null -eq $lastSuccess) {
-        $source = 'task'
-        foreach ($entry in $sync) {
-            if ($entry.LastTaskResult -ne 0) { continue }
-            $date = ConvertFrom-ICTDate $entry.LastTaskRunTime
-            if ($date -and ($null -eq $lastSuccess -or $date -gt $lastSuccess)) { $lastSuccess = $date }
-        }
+        New-ICTRuleResult 'ENR-004' 'Last check-in' Unknown 'no successful check-in recorded' -Message 'No successful Intune check-in could be found on the device.'
     }
+    elseif (($Now - $lastSuccess).TotalDays -gt $Config.MaxDaysSinceLastSync) {
+        New-ICTRuleResult 'ENR-004' 'Last check-in' Fail ('{0}{1} (limit {2} days)' -f (Format-ICTRelativeTime $lastSuccess -Now $Now), $suffix, $Config.MaxDaysSinceLastSync) -Action Sync `
+            -Message 'The device has not checked in with Intune recently.' `
+            -Remediation 'Trigger a sync (this tool: -Remediate tries a sync first and re-enrolls only if the sync fails).'
+    }
+    else { New-ICTRuleResult 'ENR-004' 'Last check-in' Pass ((Format-ICTRelativeTime $lastSuccess -Now $Now) + $suffix) }
+}
 
-    if ($null -eq $lastSuccess) {
-        New-ICTRuleResult -Id 'ENR-004' -Category 'Enrollment' -Name 'Last check-in' -Status Unknown -Actual 'no successful check-in recorded' `
-            -Message 'No successful Intune check-in could be found on the device.'
+function Get-ICTAutoEnrollRule {
+    <# Explains why an unenrolled device did not auto-enroll (shown only when it is not enrolled). #>
+    [CmdletBinding()]
+    param([psobject]$AutoEnroll, [datetime]$Now)
+
+    $policy = $(if ($AutoEnroll.PolicyAutoEnroll -eq 1) { 'auto-enrollment GPO on' } else { 'no auto-enrollment GPO' })
+    if ($AutoEnroll.LastResult -eq 'Failed') {
+        $code = $AutoEnroll.LastErrorCode
+        $known = $(if ($code) { $script:ICTEnrollErrors[$code] } else { $null })
+        $actual = 'last attempt failed {0}: {1}' -f (Format-ICTRelativeTime $AutoEnroll.LastResultTime -Now $Now), $(if ($code) { $code } else { 'unknown error' })
+        if ($known) { $actual += " ($($known.Text))" }
+        $extra = @{}
+        if ($known -and $known.Blocks) { $extra.Blocks = 'ReEnroll' }
+        New-ICTRuleResult 'ENR-005' 'Auto-enrollment' Warning $actual @extra `
+            -Message "Windows tried to enroll the device automatically and failed ($policy)." `
+            -Remediation 'Fix the cause in Intune / Entra ID (license, MDM user scope, enrollment restrictions), then repair.'
     }
-    else {
-        $ageDays = ($Now - $lastSuccess).TotalDays
-        $actual = Format-ICTRelativeTime $lastSuccess -Now $Now
-        if ($source -eq 'task') { $actual = "$actual (task run)" }
-        if ($ageDays -gt $Config.MaxDaysSinceLastSync) {
-            New-ICTRuleResult -Id 'ENR-004' -Category 'Enrollment' -Name 'Last check-in' -Status Fail -Action Sync `
-                -Actual ('{0} (limit {1} days)' -f $actual, $Config.MaxDaysSinceLastSync) `
-                -Message 'The device has not checked in with Intune recently.' `
-                -Remediation 'Trigger a sync (this tool: -Remediate tries a sync first and re-enrolls only if the sync fails).'
-        }
-        else {
-            New-ICTRuleResult -Id 'ENR-004' -Category 'Enrollment' -Name 'Last check-in' -Status Pass -Actual $actual
-        }
+    elseif ($AutoEnroll.LastResult -eq 'Succeeded') {
+        New-ICTRuleResult 'ENR-005' 'Auto-enrollment' Info ('last attempt succeeded {0}, enrollment removed since' -f (Format-ICTRelativeTime $AutoEnroll.LastResultTime -Now $Now))
     }
+    else { New-ICTRuleResult 'ENR-005' 'Auto-enrollment' Info "no attempt logged, $policy" }
 }
 
 function Get-ICTHealthRule {
@@ -191,92 +203,100 @@ function Get-ICTHealthRule {
     param([psobject]$DeviceData, [psobject]$Config, [datetime]$Now)
 
     $friendly = @{ dmwappushservice = 'WAP push service'; IntuneManagementExtension = 'Intune Mgmt Extension' }
-    $services = @($DeviceData.Services | Where-Object { $_ })
     $required = @($Config.RequiredServices)
-
     foreach ($name in @(@($Config.RequiredServices) + @($Config.RecommendedServices) | Where-Object { $_ })) {
-        $isRequired = $required -contains $name
         $label = $(if ($friendly.ContainsKey($name)) { $friendly[$name] } else { $name })
         $id = 'SVC-' + $name
-        $service = $services | Where-Object { $_.Name -eq $name } | Select-Object -First 1
-        $problem = $(if ($isRequired) { 'Fail' } else { 'Warning' })
+        $problem = $(if ($required -contains $name) { 'Fail' } else { 'Warning' })
+        $service = @($DeviceData.Services | Where-Object { $_ -and $_.Name -eq $name }) | Select-Object -First 1
 
-        if ($null -eq $service) {
-            New-ICTRuleResult -Id $id -Category 'Health' -Name $label -Status Unknown -Actual 'state unavailable'
-        }
+        if ($null -eq $service) { New-ICTRuleResult $id $label Unknown 'state unavailable' }
         elseif (-not $service.Present) {
-            $message = "The service '$name' is not installed."
-            if ($name -eq 'IntuneManagementExtension') { $message = 'The Intune Management Extension is not installed. That is normal when no Win32 apps, scripts or remediations are assigned.' }
-            New-ICTRuleResult -Id $id -Category 'Health' -Name $label -Status $problem -Actual 'not installed' -Message $message
+            $message = $(if ($name -eq 'IntuneManagementExtension') { 'Not installed. That is normal when no Win32 apps, scripts or remediations are assigned.' } else { "The service '$name' is not installed." })
+            New-ICTRuleResult $id $label $problem 'not installed' -Message $message
         }
         elseif ($service.StartType -eq 'Disabled') {
-            New-ICTRuleResult -Id $id -Category 'Health' -Name $label -Status $problem -Actual 'disabled' `
-                -Message "The service '$name' is disabled." -Remediation "Set-Service -Name $name -StartupType Manual (or Automatic for the Intune Management Extension)."
+            New-ICTRuleResult $id $label $problem 'disabled' -Action ServiceFix -Message "The service '$name' is disabled." -Remediation 'The tool sets it back to its normal start type (-Remediate).'
         }
         elseif ($service.StartType -eq 'Automatic' -and $service.Status -ne 'Running') {
-            New-ICTRuleResult -Id $id -Category 'Health' -Name $label -Status Warning -Actual ('{0} (Automatic)' -f $service.Status) `
-                -Message "The service '$name' should be running." -Remediation "Start-Service -Name $name"
+            New-ICTRuleResult $id $label Warning ('{0} (Automatic)' -f $service.Status) -Action ServiceFix -Message "The service '$name' should be running." -Remediation 'The tool starts it (-Remediate).'
         }
-        else {
-            $actual = '{0} ({1})' -f $service.Status, $service.StartType
-            if ($service.StartType -eq 'Manual' -and $service.Status -ne 'Running') { $actual = 'Manual (starts on demand)' }
-            New-ICTRuleResult -Id $id -Category 'Health' -Name $label -Status Pass -Actual $actual
-        }
+        elseif ($service.StartType -eq 'Manual' -and $service.Status -ne 'Running') { New-ICTRuleResult $id $label Pass 'Manual (starts on demand)' }
+        else { New-ICTRuleResult $id $label Pass ('{0} ({1})' -f $service.Status, $service.StartType) }
     }
 
     $events = $DeviceData.MdmEvents
-    if ($null -eq $events) {
-        New-ICTRuleResult -Id 'EVT-001' -Category 'Health' -Name 'MDM error events' -Status Unknown -Actual 'event log unavailable'
-    }
-    elseif ($events.ErrorCount -eq 0) {
-        New-ICTRuleResult -Id 'EVT-001' -Category 'Health' -Name 'MDM error events' -Status Pass -Actual ('none in {0} days' -f $events.LookbackDays)
-    }
+    if ($null -eq $events) { New-ICTRuleResult 'EVT-001' 'MDM error events' Unknown 'event log unavailable' }
+    elseif ($events.ErrorCount -eq 0) { New-ICTRuleResult 'EVT-001' 'MDM error events' Pass ('none in {0} days' -f $events.LookbackDays) }
     else {
         $latest = @($events.Recent) | Select-Object -First 1
-        $when = $(if ($latest) { ', latest ' + (Format-ICTRelativeTime $latest.TimeCreated -Now $Now) } else { '' })
-        New-ICTRuleResult -Id 'EVT-001' -Category 'Health' -Name 'MDM error events' -Status Warning `
-            -Actual ('{0} in {1} days{2}' -f $events.ErrorCount, $events.LookbackDays, $when) `
+        $count = $(if ($events.Truncated) { "$($events.ErrorCount)+" } else { "$($events.ErrorCount)" })
+        New-ICTRuleResult 'EVT-001' 'MDM error events' Warning ('{0} in {1} days, latest {2}' -f $count, $events.LookbackDays, (Format-ICTRelativeTime $latest.TimeCreated -Now $Now)) `
             -Message 'The MDM client logged errors. Run with -Detailed to see them.' `
             -Remediation 'Event Viewer: Applications and Services Logs > Microsoft > Windows > DeviceManagement-Enterprise-Diagnostics-Provider > Admin.'
     }
+
+    $reboot = $DeviceData.PendingReboot
+    $boot = ConvertFrom-ICTDate $DeviceData.Device.LastBootTime
+    $uptime = $(if ($boot) { 'up ' + ((Format-ICTRelativeTime $boot -Now $Now) -replace ' ago$', '') } else { 'uptime unknown' })
+    if ($null -eq $reboot) { New-ICTRuleResult 'HLT-REBOOT' 'Pending reboot' Unknown 'could not read' }
+    elseif ($reboot.Pending) {
+        New-ICTRuleResult 'HLT-REBOOT' 'Pending reboot' Warning ('yes, {0} ({1})' -f (@($reboot.Reasons) -join ', '), $uptime) `
+            -Message 'Updates wait for a reboot. Until then the OS version (and compliance) does not change.' -Remediation 'Ask the user to restart the device.'
+    }
+    elseif ($boot -and ($Now - $boot).TotalDays -gt $Config.MaxUptimeDays) {
+        New-ICTRuleResult 'HLT-REBOOT' 'Pending reboot' Warning ('no, but {0}' -f $uptime) -Message 'The device has not restarted for a long time.' -Remediation 'Ask the user to restart the device.'
+    }
+    else { New-ICTRuleResult 'HLT-REBOOT' 'Pending reboot' Pass ('no ({0})' -f $uptime) }
 }
 
 function Get-ICTNetworkRule {
     [CmdletBinding()]
-    param([psobject]$DeviceData)
+    param([psobject]$DeviceData, [psobject]$Config)
 
     $network = $DeviceData.Network
-    $proxy = $null
-    if ($network) { $proxy = $network.WinHttpProxy }
+    if ($null -eq $network) { New-ICTRuleResult 'NET-ENDPOINTS' 'Network' Unknown 'not checked'; return }
+    $proxy = $network.WinHttpProxy
     $proxyConfigured = ($proxy -and $proxy.ProxyConfigured)
+    if ($null -eq $proxy) { New-ICTRuleResult 'NET-PROXY' 'WinHTTP proxy' Unknown 'unavailable' }
+    else { New-ICTRuleResult 'NET-PROXY' 'WinHTTP proxy' Info $(if ($proxyConfigured) { $proxy.ProxyServer } else { 'none (direct)' }) }
 
-    if ($null -eq $proxy) {
-        New-ICTRuleResult -Id 'NET-PROXY' -Category 'Network' -Name 'WinHTTP proxy' -Status Unknown -Actual 'unavailable'
-    }
-    elseif ($proxyConfigured) {
-        New-ICTRuleResult -Id 'NET-PROXY' -Category 'Network' -Name 'WinHTTP proxy' -Status Info -Actual $proxy.ProxyServer
-    }
-    else {
-        New-ICTRuleResult -Id 'NET-PROXY' -Category 'Network' -Name 'WinHTTP proxy' -Status Info -Actual 'none (direct)'
-    }
-
+    if ($null -eq $network.Endpoints) { New-ICTRuleResult 'NET-ENDPOINTS' 'Endpoints' Unknown 'could not test' }
     foreach ($endpoint in @($network.Endpoints | Where-Object { $_ })) {
         $id = 'NET-' + $endpoint.HostName
         $name = '{0}:{1}' -f $endpoint.HostName, $endpoint.Port
-        if ($endpoint.Reachable) {
-            New-ICTRuleResult -Id $id -Category 'Network' -Name $name -Status Pass -Actual 'reachable'
-        }
+        if ($endpoint.Reachable) { New-ICTRuleResult $id $name Pass 'reachable' }
         elseif ($proxyConfigured) {
-            New-ICTRuleResult -Id $id -Category 'Network' -Name $name -Status Warning -Actual 'no direct connection' `
+            New-ICTRuleResult $id $name Warning 'no direct connection' `
                 -Message "Direct connection failed ($($endpoint.Error)). The device uses the WinHTTP proxy $($proxy.ProxyServer), which this check does not use." `
                 -Remediation 'Verify that the proxy allows this host.'
         }
         else {
-            New-ICTRuleResult -Id $id -Category 'Network' -Name $name -Status Fail -Actual 'unreachable' -BlocksRemediation `
+            New-ICTRuleResult $id $name Fail 'unreachable' -Blocks All `
                 -Message "The device cannot reach $($endpoint.HostName) on port $($endpoint.Port): $($endpoint.Error)" `
                 -Remediation 'Fix DNS, firewall or proxy access to the Microsoft Intune and Entra ID endpoints first.'
         }
     }
+
+    $offset = $network.ClockOffsetSeconds
+    if ($null -eq $offset -and $network.ClockError -like 'TLS certificate rejected*') {
+        New-ICTRuleResult 'NET-TIME' 'Clock' Fail 'not measurable, server certificate rejected' -Action TimeSync -Message $network.ClockError `
+            -Remediation 'Check the date and time; the tool resynchronises the time service (-Remediate).'
+        return
+    }
+    if ($null -eq $offset) { New-ICTRuleResult 'NET-TIME' 'Clock' Info 'not measured (no HTTPS response)' -Message $network.ClockError; return }
+    $direction = $(if ($offset -gt 0) { 'ahead' } else { 'behind' })
+    $size = [math]::Abs($offset)
+    $text = $(if ($size -ge 120) { '{0} min {1}' -f [int][math]::Round($size / 60), $direction } else { '{0} s {1}' -f $size, $direction })
+    if ($size -gt $Config.MaxClockSkewSeconds) {
+        New-ICTRuleResult 'NET-TIME' 'Clock' Fail $text -Action TimeSync `
+            -Message 'The local clock is far off. Certificate and token checks against Intune and Entra ID fail with this skew.' `
+            -Remediation 'The tool resynchronises the time service (-Remediate).'
+    }
+    elseif ($size -gt 60) {
+        New-ICTRuleResult 'NET-TIME' 'Clock' Warning $text -Action TimeSync -Message 'The local clock drifts.' -Remediation 'The tool resynchronises the time service (-Remediate).'
+    }
+    else { New-ICTRuleResult 'NET-TIME' 'Clock' Pass ('in sync ({0} s)' -f $offset) }
 }
 
 function Get-ICTSecurityRule {
@@ -286,118 +306,89 @@ function Get-ICTSecurityRule {
     $device = $DeviceData.Device
     $security = $DeviceData.Security
 
-    if ($null -eq $device -or $null -eq $device.OSBuild) {
-        New-ICTRuleResult -Id 'SEC-001' -Category 'Security' -Name 'OS build' -Status Unknown -Actual 'unavailable'
-    }
+    if ($null -eq $device.OSBuild) { New-ICTRuleResult 'SEC-001' 'OS build' Unknown 'unavailable' }
     else {
         $build = [string]$device.OSBuild
-        if ($null -ne $device.OSUpdateBuildRevision) { $build = '{0}.{1}' -f $device.OSBuild, $device.OSUpdateBuildRevision }
-        $actual = '{0} (min {1})' -f $build, $Config.MinimumOSBuild
+        $minimumRevision = $null
+        if ($Config.MinimumOSRevision) {
+            $entry = $Config.MinimumOSRevision.PSObject.Properties[$build]
+            if ($entry) { $minimumRevision = [int]$entry.Value }
+        }
+        $current = $(if ($null -ne $device.OSUpdateBuildRevision) { '{0}.{1}' -f $build, $device.OSUpdateBuildRevision } else { $build })
+        $minimum = $(if ($null -ne $minimumRevision) { '{0}.{1}' -f $build, $minimumRevision } else { [string]$Config.MinimumOSBuild })
+        $actual = '{0} (min {1})' -f $current, $minimum
         if ([int]$device.OSBuild -lt [int]$Config.MinimumOSBuild) {
-            New-ICTRuleResult -Id 'SEC-001' -Category 'Security' -Name 'OS build' -Status Fail -Actual $actual `
-                -Message 'The Windows build is older than the minimum.' -Remediation 'Install the latest Windows feature update.'
+            New-ICTRuleResult 'SEC-001' 'OS build' Fail $actual -Message 'The Windows build is older than the minimum.' -Remediation 'Install the latest Windows feature update.'
         }
-        else {
-            New-ICTRuleResult -Id 'SEC-001' -Category 'Security' -Name 'OS build' -Status Pass -Actual $actual
+        elseif ($null -ne $minimumRevision -and $null -eq $device.OSUpdateBuildRevision) { New-ICTRuleResult 'SEC-001' 'OS build' Unknown "$build (update revision unavailable)" }
+        elseif ($null -ne $minimumRevision -and [int]$device.OSUpdateBuildRevision -lt $minimumRevision) {
+            New-ICTRuleResult 'SEC-001' 'OS build' Fail $actual -Message 'The latest cumulative update is missing (Intune compares the full OS version).' `
+                -Remediation 'Install the latest cumulative update and restart the device.'
         }
+        else { New-ICTRuleResult 'SEC-001' 'OS build' Pass $actual }
     }
 
     if ($Config.RequireBitLocker) {
-        $bitLocker = $(if ($security) { $security.BitLocker } else { $null })
-        if ($null -eq $bitLocker) {
-            New-ICTRuleResult -Id 'SEC-002' -Category 'Security' -Name 'BitLocker' -Status Unknown -Actual 'unavailable (needs admin)'
-        }
-        elseif ($bitLocker.ProtectionOn) {
-            $actual = 'On'
-            if ($bitLocker.EncryptionMethod) { $actual = 'On ({0})' -f $bitLocker.EncryptionMethod }
-            New-ICTRuleResult -Id 'SEC-002' -Category 'Security' -Name 'BitLocker' -Status Pass -Actual $actual
-        }
+        $bitLocker = $security.BitLocker
+        if ($null -eq $bitLocker) { New-ICTRuleResult 'SEC-002' 'BitLocker' Unknown 'unavailable (needs admin)' }
+        elseif ($bitLocker.ProtectionOn) { New-ICTRuleResult 'SEC-002' 'BitLocker' Pass $(if ($bitLocker.EncryptionMethod) { 'On ({0})' -f $bitLocker.EncryptionMethod } else { 'On' }) }
         else {
-            $actual = 'Off'
-            if ($bitLocker.VolumeStatus) { $actual = 'Off ({0})' -f $bitLocker.VolumeStatus }
-            New-ICTRuleResult -Id 'SEC-002' -Category 'Security' -Name 'BitLocker' -Status Fail -Actual $actual `
+            New-ICTRuleResult 'SEC-002' 'BitLocker' Fail $(if ($bitLocker.VolumeStatus) { 'Off ({0})' -f $bitLocker.VolumeStatus } else { 'Off' }) `
                 -Message "BitLocker protection is off on $($bitLocker.MountPoint)." -Remediation 'Check the Intune disk encryption policy and the BitLocker event log.'
         }
     }
 
     if ($Config.RequireTpm) {
-        $tpm = $(if ($security) { $security.Tpm } else { $null })
-        if ($null -eq $tpm) {
-            New-ICTRuleResult -Id 'SEC-003' -Category 'Security' -Name 'TPM' -Status Unknown -Actual 'unavailable (needs admin)'
-        }
-        elseif ($tpm.Present -and $tpm.Ready) {
-            New-ICTRuleResult -Id 'SEC-003' -Category 'Security' -Name 'TPM' -Status Pass -Actual 'present, ready'
-        }
+        $tpm = $security.Tpm
+        if ($null -eq $tpm) { New-ICTRuleResult 'SEC-003' 'TPM' Unknown 'unavailable (needs admin)' }
+        elseif ($tpm.Present -and $tpm.Ready) { New-ICTRuleResult 'SEC-003' 'TPM' Pass 'present, ready' }
         else {
-            $actual = $(if (-not $tpm.Present) { 'not present' } else { 'present, not ready' })
-            New-ICTRuleResult -Id 'SEC-003' -Category 'Security' -Name 'TPM' -Status Fail -Actual $actual `
+            New-ICTRuleResult 'SEC-003' 'TPM' Fail $(if (-not $tpm.Present) { 'not present' } else { 'present, not ready' }) `
                 -Message 'The TPM is missing or not ready.' -Remediation 'Enable the TPM in the firmware settings and run tpm.msc to initialise it.'
         }
     }
 
     if ($Config.RequireSecureBoot) {
-        $secureBoot = $(if ($security) { $security.SecureBoot } else { $null })
-        if ($null -eq $secureBoot) {
-            New-ICTRuleResult -Id 'SEC-004' -Category 'Security' -Name 'Secure Boot' -Status Unknown -Actual 'unavailable (needs admin)'
-        }
-        elseif ($secureBoot.Enabled) {
-            New-ICTRuleResult -Id 'SEC-004' -Category 'Security' -Name 'Secure Boot' -Status Pass -Actual 'On'
-        }
+        $secureBoot = $security.SecureBoot
+        if ($null -eq $secureBoot) { New-ICTRuleResult 'SEC-004' 'Secure Boot' Unknown 'unavailable (needs admin)' }
+        elseif ($secureBoot.Enabled) { New-ICTRuleResult 'SEC-004' 'Secure Boot' Pass 'On' }
         else {
-            $actual = $(if ($secureBoot.Supported) { 'Off' } else { 'not supported (legacy BIOS)' })
-            New-ICTRuleResult -Id 'SEC-004' -Category 'Security' -Name 'Secure Boot' -Status Fail -Actual $actual `
+            New-ICTRuleResult 'SEC-004' 'Secure Boot' Fail $(if ($secureBoot.Supported) { 'Off' } else { 'not supported (legacy BIOS)' }) `
                 -Message 'Secure Boot is not enabled.' -Remediation 'Switch the firmware to UEFI and enable Secure Boot.'
         }
     }
 
-    $defender = $(if ($security) { $security.Defender } else { $null })
+    $defender = $security.Defender
     if ($Config.RequireDefenderRealTimeProtection) {
-        if ($null -eq $defender) {
-            New-ICTRuleResult -Id 'SEC-005' -Category 'Security' -Name 'Defender real-time' -Status Unknown -Actual 'unavailable'
-        }
+        if ($null -eq $defender) { New-ICTRuleResult 'SEC-005' 'Defender real-time' Unknown 'unavailable' }
         elseif ($defender.AMRunningMode -match 'Passive') {
-            New-ICTRuleResult -Id 'SEC-005' -Category 'Security' -Name 'Defender real-time' -Status Warning -Actual 'passive mode' `
-                -Message 'Defender runs in passive mode, usually because another antivirus product is installed.' `
+            New-ICTRuleResult 'SEC-005' 'Defender real-time' Warning 'passive mode' -Message 'Defender runs in passive mode, usually because another antivirus product is installed.' `
                 -Remediation 'Check that the other antivirus product is reported to Windows Security Center.'
         }
-        elseif ($defender.AMServiceEnabled -and $defender.RealTimeProtectionEnabled) {
-            New-ICTRuleResult -Id 'SEC-005' -Category 'Security' -Name 'Defender real-time' -Status Pass -Actual 'On'
-        }
+        elseif ($defender.AMServiceEnabled -and $defender.RealTimeProtectionEnabled) { New-ICTRuleResult 'SEC-005' 'Defender real-time' Pass 'On' }
         else {
-            New-ICTRuleResult -Id 'SEC-005' -Category 'Security' -Name 'Defender real-time' -Status Fail -Actual 'Off' `
-                -Message 'Microsoft Defender real-time protection is off.' -Remediation 'Check the Intune antivirus policy and tamper protection.'
+            New-ICTRuleResult 'SEC-005' 'Defender real-time' Fail 'Off' -Message 'Microsoft Defender real-time protection is off.' -Remediation 'Check the Intune antivirus policy and tamper protection.'
         }
     }
 
     if ($null -ne $Config.MaxDefenderSignatureAgeDays -and $null -ne $defender -and $defender.AMRunningMode -notmatch 'Passive') {
         $age = $defender.AntivirusSignatureAgeDays
-        if ($null -eq $age) {
-            New-ICTRuleResult -Id 'SEC-006' -Category 'Security' -Name 'Defender signatures' -Status Unknown -Actual 'age unknown'
-        }
+        if ($null -eq $age) { New-ICTRuleResult 'SEC-006' 'Defender signatures' Unknown 'age unknown' }
         elseif ([int]$age -gt [int]$Config.MaxDefenderSignatureAgeDays) {
-            New-ICTRuleResult -Id 'SEC-006' -Category 'Security' -Name 'Defender signatures' -Status Fail `
-                -Actual ('{0} days old (limit {1})' -f $age, $Config.MaxDefenderSignatureAgeDays) `
+            New-ICTRuleResult 'SEC-006' 'Defender signatures' Fail ('{0} days old (limit {1})' -f $age, $Config.MaxDefenderSignatureAgeDays) `
                 -Message 'Defender signatures are out of date.' -Remediation 'Run "Update-MpSignature" and check Windows Update / WSUS access.'
         }
-        else {
-            $actual = $(if ([int]$age -eq 0) { 'up to date' } else { '{0} days old' -f $age })
-            New-ICTRuleResult -Id 'SEC-006' -Category 'Security' -Name 'Defender signatures' -Status Pass -Actual $actual
-        }
+        else { New-ICTRuleResult 'SEC-006' 'Defender signatures' Pass $(if ([int]$age -eq 0) { 'up to date' } else { '{0} days old' -f $age }) }
     }
 
     if ($Config.RequireFirewallAllProfiles) {
-        $firewall = @($(if ($security) { $security.Firewall } else { $null }) | Where-Object { $_ })
-        if ($firewall.Count -eq 0) {
-            New-ICTRuleResult -Id 'SEC-007' -Category 'Security' -Name 'Firewall' -Status Unknown -Actual 'unavailable'
-        }
+        $firewall = @($security.Firewall | Where-Object { $_ })
+        if ($firewall.Count -eq 0) { New-ICTRuleResult 'SEC-007' 'Firewall' Unknown 'unavailable' }
         else {
             $off = @($firewall | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Profile })
-            if ($off.Count -eq 0) {
-                New-ICTRuleResult -Id 'SEC-007' -Category 'Security' -Name 'Firewall' -Status Pass -Actual (((@($firewall | ForEach-Object { $_.Profile })) -join ', ') + ' on')
-            }
+            if ($off.Count -eq 0) { New-ICTRuleResult 'SEC-007' 'Firewall' Pass ((@($firewall | ForEach-Object { $_.Profile }) -join ', ') + ' on') }
             else {
-                New-ICTRuleResult -Id 'SEC-007' -Category 'Security' -Name 'Firewall' -Status Fail -Actual (($off -join ', ') + ' off') `
-                    -Message 'Windows Firewall is off for at least one profile.' -Remediation 'Check the Intune firewall policy.'
+                New-ICTRuleResult 'SEC-007' 'Firewall' Fail (($off -join ', ') + ' off') -Message 'Windows Firewall is off for at least one profile (effective policy).' -Remediation 'Check the Intune firewall policy.'
             }
         }
     }
@@ -409,107 +400,88 @@ function Get-ICTLapsRule {
 
     if (-not $Config.RequireLaps) { return }
     $laps = $DeviceData.Laps
-    $targetText = @{ EntraId = 'Entra ID'; ActiveDirectory = 'Active Directory'; Disabled = 'disabled'; Unknown = 'unknown target' }
+    $targetText = @{ EntraId = 'Entra ID'; ActiveDirectory = 'Active Directory'; Disabled = 'disabled'; Legacy = 'legacy LAPS'; Unknown = 'unknown target' }
 
-    if ($null -eq $laps) {
-        New-ICTRuleResult -Id 'LAPS-001' -Category 'LAPS' -Name 'LAPS policy' -Status Unknown -Actual 'unavailable'
-        return
-    }
+    if ($null -eq $laps) { New-ICTRuleResult 'LAPS-001' 'LAPS policy' Unknown 'could not read the LAPS policy'; return }
     if (-not $laps.Configured) {
-        New-ICTRuleResult -Id 'LAPS-001' -Category 'LAPS' -Name 'LAPS policy' -Status Fail -Actual 'not configured' `
+        New-ICTRuleResult 'LAPS-001' 'LAPS policy' Fail 'not configured' `
             -Message 'No Windows LAPS policy is applied, so the local admin password is not rotated or backed up.' `
             -Remediation 'Assign the Intune LAPS policy (Endpoint security > Account protection) to this device.'
         return
     }
-
-    $policyText = 'active - backup to {0} ({1})' -f $targetText[$laps.BackupTarget], $laps.PolicySource
-    if ($laps.BackupTarget -eq 'Disabled') {
-        New-ICTRuleResult -Id 'LAPS-001' -Category 'LAPS' -Name 'LAPS policy' -Status Fail -Actual 'backup disabled' `
-            -Message 'A LAPS policy exists but its backup directory is set to disabled.' -Remediation 'Set the backup directory to Entra ID in the Intune LAPS policy.'
+    if ($laps.BackupTarget -eq 'Legacy') {
+        New-ICTRuleResult 'LAPS-001' 'LAPS policy' Warning 'legacy Microsoft LAPS (AdmPwd)' `
+            -Message 'Only the legacy Microsoft LAPS policy is set; Windows LAPS is not configured.' -Remediation 'Move the device to the Windows LAPS policy in Intune.'
         return
     }
-    elseif ($laps.BackupTarget -ne $Config.LapsExpectedBackupTarget) {
-        New-ICTRuleResult -Id 'LAPS-001' -Category 'LAPS' -Name 'LAPS policy' -Status Warning -Actual $policyText `
-            -Message ('LAPS backs up to {0}, expected {1}.' -f $targetText[$laps.BackupTarget], $targetText[$Config.LapsExpectedBackupTarget])
+    if ($laps.BackupTarget -eq 'Disabled') {
+        New-ICTRuleResult 'LAPS-001' 'LAPS policy' Fail 'backup disabled' -Message 'A LAPS policy exists, but its backup directory is not set (disabled).' `
+            -Remediation 'Set the backup directory to Entra ID in the Intune LAPS policy.'
+        return
     }
-    else {
-        New-ICTRuleResult -Id 'LAPS-001' -Category 'LAPS' -Name 'LAPS policy' -Status Pass -Actual $policyText
+    $policyText = 'backup to {0} ({1}{2})' -f $targetText[$laps.BackupTarget], $laps.PolicySource, $(if ($laps.AutomaticAccountManagement) { ', automatic account' } else { '' })
+    if ($laps.BackupTarget -ne $Config.LapsExpectedBackupTarget) {
+        New-ICTRuleResult 'LAPS-001' 'LAPS policy' Warning $policyText -Message ('LAPS backs up to {0}, expected {1}.' -f $targetText[$laps.BackupTarget], $targetText[$Config.LapsExpectedBackupTarget])
     }
+    else { New-ICTRuleResult 'LAPS-001' 'LAPS policy' Pass $policyText }
 
-    # Managed account
     $account = $laps.Account
     $expected = $Config.LapsExpectedAccount
-    if ($null -eq $account) {
-        New-ICTRuleResult -Id 'LAPS-002' -Category 'LAPS' -Name 'Managed account' -Status Unknown -Actual 'unavailable'
-    }
+    $automatic = [bool]$laps.AutomaticAccountManagement   # LAPS owns the account: fixes go through the policy
+    $policyFix = 'Adjust the automatic account management settings of the Intune LAPS policy.'
+    if ($null -eq $account) { New-ICTRuleResult 'LAPS-002' 'Managed account' Unknown 'could not read the account' }
     elseif (-not $account.Exists) {
-        $name = $(if ($laps.AdministratorAccountName) { $laps.AdministratorAccountName } else { 'built-in Administrator' })
-        New-ICTRuleResult -Id 'LAPS-002' -Category 'LAPS' -Name 'Managed account' -Status Fail -Actual "$name does not exist" `
-            -Message 'The account LAPS should manage does not exist on this device.' `
-            -Remediation 'Create the account, or enable automatic account management in the LAPS policy.'
+        New-ICTRuleResult 'LAPS-002' 'Managed account' Fail "$($account.Name) does not exist" -Message 'The account LAPS should manage does not exist on this device.' `
+            -Remediation $(if ($automatic) { 'Wait for the next LAPS cycle, which creates it, or check the LAPS event log.' } else { 'Create the account, or enable automatic account management in the LAPS policy.' })
+    }
+    elseif ($account.Enabled -eq $false -and $automatic -and -not $laps.AutomaticAccountEnabled) {
+        New-ICTRuleResult 'LAPS-002' 'Managed account' Pass "$($account.Name) (disabled by LAPS policy)"
     }
     elseif ($account.Enabled -eq $false) {
-        New-ICTRuleResult -Id 'LAPS-002' -Category 'LAPS' -Name 'Managed account' -Status Fail -Actual "$($account.Name) (disabled)" `
-            -Message 'The LAPS-managed account is disabled.' -Remediation "Enable-LocalUser -Name $($account.Name)"
+        New-ICTRuleResult 'LAPS-002' 'Managed account' Fail "$($account.Name) (disabled)" -Message 'The LAPS-managed account is disabled.' `
+            -Remediation $(if ($automatic) { $policyFix } else { "Enable-LocalUser -Name $($account.Name)" })
     }
     elseif ($account.IsAdministrator -eq $false) {
-        New-ICTRuleResult -Id 'LAPS-002' -Category 'LAPS' -Name 'Managed account' -Status Fail -Actual "$($account.Name) (not an administrator)" `
-            -Message 'The LAPS-managed account is not in the local Administrators group.' `
-            -Remediation "Add-LocalGroupMember -SID S-1-5-32-544 -Member $($account.Name)"
+        New-ICTRuleResult 'LAPS-002' 'Managed account' Fail "$($account.Name) (not an administrator)" -Message 'The LAPS-managed account is not in the local Administrators group.' `
+            -Remediation $(if ($automatic) { $policyFix } else { "Add-LocalGroupMember -SID S-1-5-32-544 -Member $($account.Name)" })
     }
-    elseif ($expected -and $account.Name -ne $expected) {
-        New-ICTRuleResult -Id 'LAPS-002' -Category 'LAPS' -Name 'Managed account' -Status Warning -Actual "$($account.Name) (expected $expected)" `
+    elseif ($expected -and $account.Name -ne $expected -and $account.Name -notmatch ('^' + [regex]::Escape($expected) + '\d{6}$')) {
+        New-ICTRuleResult 'LAPS-002' 'Managed account' Warning "$($account.Name) (expected $expected)" `
             -Message "LAPS manages '$($account.Name)', not '$expected'. The password of '$expected' is then not rotated by LAPS."
     }
     else {
-        $details = $(if ($null -eq $account.IsAdministrator) { 'enabled' } else { 'enabled, administrator' })
-        New-ICTRuleResult -Id 'LAPS-002' -Category 'LAPS' -Name 'Managed account' -Status Pass -Actual "$($account.Name) ($details)"
+        New-ICTRuleResult 'LAPS-002' 'Managed account' Pass ('{0} ({1})' -f $account.Name, $(if ($null -eq $account.IsAdministrator) { 'enabled' } else { 'enabled, administrator' }))
     }
 
-    # Last rotation
     $lastUpdate = ConvertFrom-ICTDate $laps.LastPasswordUpdateTime
-    if ($null -eq $lastUpdate) {
-        New-ICTRuleResult -Id 'LAPS-003' -Category 'LAPS' -Name 'Last rotation' -Status Unknown -Actual 'no rotation recorded'
-    }
+    if ($null -eq $lastUpdate) { New-ICTRuleResult 'LAPS-003' 'Last rotation' Unknown 'no rotation recorded' }
     else {
         $actual = '{0} (every {1} days)' -f (Format-ICTRelativeTime $lastUpdate -Now $Now), $laps.PasswordAgeDays
         if (($Now - $lastUpdate).TotalDays -gt ($laps.PasswordAgeDays + 1)) {
-            New-ICTRuleResult -Id 'LAPS-003' -Category 'LAPS' -Name 'Last rotation' -Status Fail -Actual $actual -Action LapsRetry `
-                -Message 'The LAPS password is older than the rotation interval.' `
-                -Remediation 'Run Invoke-LapsPolicyProcessing and check the LAPS event log.'
+            New-ICTRuleResult 'LAPS-003' 'Last rotation' Fail $actual -Action LapsRetry -Message 'The LAPS password is older than the rotation interval.' `
+                -Remediation 'Run Invoke-LapsPolicyProcessing (this tool: -Remediate) and check the LAPS event log.'
         }
-        else {
-            New-ICTRuleResult -Id 'LAPS-003' -Category 'LAPS' -Name 'Last rotation' -Status Pass -Actual $actual
-        }
+        else { New-ICTRuleResult 'LAPS-003' 'Last rotation' Pass $actual }
     }
 
-    # Backup errors
     $events = $laps.Events
     $backupName = 'Backup to {0}' -f $targetText[$laps.BackupTarget]
-    if ($null -eq $events) {
-        New-ICTRuleResult -Id 'LAPS-004' -Category 'LAPS' -Name $backupName -Status Unknown -Actual 'LAPS event log unavailable'
-    }
-    elseif ($events.ErrorCount -eq 0) {
-        New-ICTRuleResult -Id 'LAPS-004' -Category 'LAPS' -Name $backupName -Status Pass -Actual ('no errors in {0} days' -f $events.LookbackDays)
-    }
+    if ($null -eq $events) { New-ICTRuleResult 'LAPS-004' $backupName Unknown 'LAPS event log unavailable' }
+    elseif ($events.ErrorCount -eq 0) { New-ICTRuleResult 'LAPS-004' $backupName Pass ('no errors in {0} days' -f $events.LookbackDays) }
     else {
         $lastError = ConvertFrom-ICTDate $events.LastErrorTime
         $lastSuccess = ConvertFrom-ICTDate $events.LastSuccessTime
         if ($null -eq $lastSuccess -or ($lastError -and $lastError -gt $lastSuccess)) {
-            New-ICTRuleResult -Id 'LAPS-004' -Category 'LAPS' -Name $backupName -Status Fail -Action LapsRetry `
-                -Actual ('last attempt failed {0} (event {1})' -f (Format-ICTRelativeTime $lastError -Now $Now), $events.LastErrorId) `
-                -Message ('LAPS logged an error: {0}' -f $events.LastErrorMessage) `
-                -Remediation 'Run Invoke-LapsPolicyProcessing (this tool: -Remediate) and check the LAPS event log.'
+            New-ICTRuleResult 'LAPS-004' $backupName Fail ('last attempt failed {0} (event {1})' -f (Format-ICTRelativeTime $lastError -Now $Now), $events.LastErrorId) -Action LapsRetry `
+                -Message ('LAPS logged an error: {0}' -f $events.LastErrorMessage) -Remediation 'Run Invoke-LapsPolicyProcessing (this tool: -Remediate) and check the LAPS event log.'
         }
         else {
-            New-ICTRuleResult -Id 'LAPS-004' -Category 'LAPS' -Name $backupName -Status Warning `
-                -Actual ('{0} error(s) in {1} days, last run OK' -f $events.ErrorCount, $events.LookbackDays) `
-                -Message ('Latest error: {0}' -f $events.LastErrorMessage)
+            New-ICTRuleResult 'LAPS-004' $backupName Warning ('{0} error(s) in {1} days, last run OK' -f $events.ErrorCount, $events.LookbackDays) -Message ('Latest error: {0}' -f $events.LastErrorMessage)
         }
     }
 
-    # Post-authentication actions
     $postText = ConvertTo-ICTLapsPostActionText -Actions $laps.PostAuthenticationActions -DelayHours $laps.PostAuthenticationResetDelayHours
-    New-ICTRuleResult -Id 'LAPS-005' -Category 'LAPS' -Name 'After sign-in' -Status Info -Actual $postText `
-        -Message 'What LAPS does after someone signs in with the managed account password. SSH logons with that password may count too; SSH keys avoid it.'
+    $postMessage = $null
+    if ($postText -notlike 'none*') { $postMessage = 'What LAPS does after someone signs in with the managed account password. SSH logons with that password may count too; SSH keys avoid it.' }
+    New-ICTRuleResult 'LAPS-005' 'After sign-in' Info $postText -Message $postMessage
 }

@@ -152,3 +152,80 @@ Describe 'Get-ICTConfig' {
         { Get-ICTConfig -Path (Join-Path $TestDrive 'missing.json') } | Should -Throw '*not found*'
     }
 }
+
+Describe 'Event and proxy helpers' {
+    It 'builds an XPath filter for levels, event ids and a time window' {
+        InModuleScope IntuneComplianceTool {
+            New-ICTEventXPath -Level 1, 2 -EventId 10004 -Days 7 | Should -Be '*[System[(Level=1 or Level=2 or EventID=10004) and TimeCreated[timediff(@SystemTime) <= 604800000]]]'
+        }
+    }
+
+    It 'picks the HTTPS proxy from a WinHTTP setting' -TestCases @(
+        @{ Server = 'proxy.contoso.com:8080'; Expected = 'proxy.contoso.com:8080' }
+        @{ Server = 'http=p1:80;https=p2:443'; Expected = 'p2:443' }
+        @{ Server = 'http=p1:80'; Expected = $null }
+    ) {
+        InModuleScope IntuneComplianceTool -Parameters @{ Server = $Server; Expected = $Expected } {
+            Get-ICTHttpProxyAddress ([pscustomobject]@{ ProxyConfigured = $true; ProxyServer = $Server }) | Should -Be $Expected
+        }
+    }
+
+    It 'returns no proxy for direct access' {
+        InModuleScope IntuneComplianceTool {
+            Get-ICTHttpProxyAddress ([pscustomobject]@{ ProxyConfigured = $false; ProxyServer = $null }) | Should -BeNullOrEmpty
+            Get-ICTHttpProxyAddress $null | Should -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'Re-enrollment helpers' {
+    It 'accepts Entra and domain users and rejects local, SSH and LAPS accounts' -TestCases @(
+        @{ User = 'AzureAD\AnnaBerger'; Expected = $null }
+        @{ User = 'CONTOSO\anna.berger'; Expected = $null }
+        @{ User = $null; Expected = 'nobody is signed in at the console' }
+        @{ User = 'PC-0421\localadmin'; Expected = 'PC-0421\localadmin is a local account' }
+        @{ User = 'PC-0421\masteruser'; Expected = 'PC-0421\masteruser is the SSH / LAPS admin account' }
+    ) {
+        InModuleScope IntuneComplianceTool -Parameters @{ User = $User; Expected = $Expected } {
+            Test-ICTEnrollmentUser -User $User -ComputerName 'PC-0421' -ExcludeAccount @('PC-0421\masteruser') | Should -Be $Expected
+        }
+    }
+
+    It 'generates a repair script that parses, is ASCII and quotes its values' {
+        InModuleScope IntuneComplianceTool {
+            $text = New-ICTRepairScript -RegistryPath @("HKLM:\SOFTWARE\Microsoft\Enrollments\8C2F41D0-5B7A-4E21-9C3D-2A6B8F1E7D45") `
+                -EnrollmentId @('8C2F41D0-5B7A-4E21-9C3D-2A6B8F1E7D45') -Thumbprint @('ABC') -EnrollerArgument '/c /AutoEnrollMDM' -StatePath "C:\Program Data\it's\state.jsonl"
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errors)
+            $errors | Should -BeNullOrEmpty
+            $text | Should -Match '^[\x09\x0A\x0D\x20-\x7E]*$'
+            $text | Should -Match ([regex]::Escape("'C:\Program Data\it''s\state.jsonl'"))
+            $text | Should -Match ([regex]::Escape("-ArgumentList '/c /AutoEnrollMDM'"))
+            $text | Should -Match ([regex]::Escape("@('ABC')"))
+        }
+    }
+
+    It 'generates an empty list when there is nothing to remove' {
+        InModuleScope IntuneComplianceTool {
+            $text = New-ICTRepairScript -EnrollerArgument '/c /AutoEnrollMDM' -StatePath 'C:\s.jsonl'
+            $text | Should -Match ([regex]::Escape('$registryPaths = @()'))
+        }
+    }
+
+    It 'quotes typographic apostrophes too' {
+        InModuleScope IntuneComplianceTool {
+            $value = 'O' + [char]0x2019 + 'Neil'
+            ConvertTo-ICTPsLiteral $value | Should -Be ("'O" + [char]0x2019 + [char]0x2019 + "Neil'")
+        }
+    }
+
+    It 'writes restore commands for keys, tasks and certificates' {
+        InModuleScope IntuneComplianceTool {
+            $lines = New-ICTRestoreText -BackupPath 'C:\B' -RegistryFile 'registry-01.reg' -Task @([pscustomobject]@{ File = 't.xml'; TaskName = 'PushLaunch'; TaskPath = '\Microsoft\Windows\EnterpriseMgmt\X\' }) `
+                -Certificate @([pscustomobject]@{ File = 'c.cer'; Thumbprint = 'ABC' })
+            ($lines -join "`n") | Should -Match ([regex]::Escape("reg.exe import 'C:\B\registry-01.reg'"))
+            ($lines -join "`n") | Should -Match 'Register-ScheduledTask -Xml'
+            ($lines -join "`n") | Should -Match 'certutil.exe -repairstore my ABC'
+        }
+    }
+}

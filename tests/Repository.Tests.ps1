@@ -43,6 +43,14 @@ Describe 'Source file <Name>' -ForEach $sourceFiles {
     }
 }
 
+Describe 'Repository hygiene' {
+    It 'mentions no AI assistant anywhere in the tracked files' {
+        $word = 'cla' + 'ude'
+        $hits = @(git -C $root grep -n -i -I $word -- . 2>$null)
+        $hits | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Module manifest' {
     It 'exports exactly the functions in Public/' {
         $manifest = Import-PowerShellDataFile -Path (Join-Path $root 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1')

@@ -10,7 +10,7 @@ function New-ICTTheme {
 
     if ($Ascii) {
         $symbols = @{
-            Pass = '[OK]  '; Fail = '[FAIL]'; Warning = '[WARN]'; Unknown = '[ ?? ]'; Info = '[INFO]'; Skipped = '[SKIP]'
+            Pass = '[OK]  '; Fail = '[FAIL]'; Warning = '[WARN]'; Unknown = '[ ?? ]'; Info = '[INFO]'
             Arrow = '->'; Dot = '-'; Ellipsis = '...'
             H = '-'; V = '|'; TL = '+'; TR = '+'; BL = '+'; BR = '+'
             HH = '='; HV = '|'; HTL = '+'; HTR = '+'; HBL = '+'; HBR = '+'
@@ -19,7 +19,7 @@ function New-ICTTheme {
     }
     else {
         $symbols = @{
-            Pass = (& $c 0x2714); Fail = (& $c 0x2718); Warning = '!'; Unknown = '?'; Info = 'i'; Skipped = '-'
+            Pass = (& $c 0x2714); Fail = (& $c 0x2718); Warning = '!'; Unknown = '?'; Info = 'i'
             Arrow = (& $c 0x2192); Dot = (& $c 0x00B7); Ellipsis = (& $c 0x2026)
             H = (& $c 0x2500); V = (& $c 0x2502); TL = (& $c 0x256D); TR = (& $c 0x256E); BL = (& $c 0x2570); BR = (& $c 0x256F)
             HH = (& $c 0x2501); HV = (& $c 0x2503); HTL = (& $c 0x250F); HTR = (& $c 0x2513); HBL = (& $c 0x2517); HBR = (& $c 0x251B)
@@ -35,7 +35,7 @@ function New-ICTTheme {
             Green = '32'; Red = '31'; Yellow = '33'; Cyan = '36'; Gray = '90'; Bold = '1'
             GreenBold = '1;32'; RedBold = '1;31'; YellowBold = '1;33'; CyanBold = '1;36'
         }
-        StatusColor = @{ Pass = 'Green'; Fail = 'Red'; Warning = 'Yellow'; Unknown = 'Gray'; Info = 'Cyan'; Skipped = 'Gray' }
+        StatusColor = @{ Pass = 'Green'; Fail = 'Red'; Warning = 'Yellow'; Unknown = 'Gray'; Info = 'Cyan' }
     }
 }
 

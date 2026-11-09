@@ -1,6 +1,6 @@
 @{
     RootModule           = 'IntuneComplianceTool.psm1'
-    ModuleVersion        = '0.1.0'
+    ModuleVersion        = '0.2.0'
     GUID                 = '62abaffe-db9d-4f72-8a65-594a41c12e50'
     Author               = 'alpahh'
     Description          = 'Collects local MDM, Intune and LAPS data from a Windows device, evaluates it against compliance and enrollment-health rules, renders the result for the terminal and can repair a broken Intune MDM enrollment.'
@@ -13,8 +13,10 @@
         'Format-ICTHeader'
         'Format-ICTProgressItem'
         'Format-ICTReport'
+        'Format-ICTSummaryLine'
         'New-ICTReport'
         'Export-ICTReport'
+        'Export-ICTDiagnostics'
         'Invoke-ICTSync'
         'Invoke-ICTReEnrollment'
         'Invoke-ICTLapsRetry'

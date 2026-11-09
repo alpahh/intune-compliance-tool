@@ -47,9 +47,10 @@ Describe 'Format-ICTReport' {
 
     It 'lists the blockers when the repair is not possible' {
         $change = { param($d) $d.MdmCertificates = @(); $d.Network.Endpoints[0].Reachable = $false }
-        $text = Get-PlainText (Format-ICTReport -Report (New-TestReport -Change $change) -Now $TestNow -NoColor)
+        $text = Get-PlainText (Format-ICTReport -Report (New-TestReport -Change $change) -Now $TestNow -NoColor -Width 120)
         $text | Should -Match 'Repair possible: no'
         $text | Should -Match 'Automatic repair is blocked by:'
+        $text | Should -Match 'try anyway with: .* -Remediate -Force'
         $text | Should -Match 'login\.microsoftonline\.com:443: unreachable'
     }
 
@@ -110,6 +111,15 @@ Describe 'Format-ICTReport' {
     }
 }
 
+Describe 'Recommended actions in the badge' {
+    It 'names quick repairs too' {
+        $change = { param($d) $d.Services[1].Status = 'Stopped'; $d.Network.ClockOffsetSeconds = 90 }
+        $text = Get-PlainText (Format-ICTReport -Report (New-TestReport -Change $change) -Now $TestNow -NoColor)
+        $text | Should -Match 'Recommended: CLOCK \+ SERVICES'
+        $text | Should -Match 'Repairable here \(clock, services\)'
+    }
+}
+
 Describe 'Format-ICTProgressItem' {
     It 'marks failed sections' {
         Format-ICTProgressItem -Name 'Security' -Succeeded $false -NoColor -Ascii | Should -Be '[WARN] Security'
@@ -117,26 +127,38 @@ Describe 'Format-ICTProgressItem' {
     }
 }
 
-Describe 'Export-ICTReport' {
-    It 'writes JSON that round-trips and HTML that escapes values' {
-        $change = { param($d) $d.ConsoleUser = '<script>alert(1)</script>' }
-        $report = New-TestReport -Change $change
-        $files = Export-ICTReport -Report $report -OutputDirectory (Join-Path $TestDrive 'reports')
+Describe 'Format-ICTSummaryLine' {
+    It 'writes one tab-separated line per device' {
+        $line = Format-ICTSummaryLine -Report (New-TestReport -Change $brokenCertificate)
+        $line.Split("`t") | Should -Be @('PC-0421', 'EnrollmentBroken', '1', '0', 'ReEnroll', 'MDM certificate')
+    }
 
-        $files.Count | Should -Be 2
-        $json = Get-Content -LiteralPath ($files | Where-Object { $_ -like '*.json' }) -Raw | ConvertFrom-Json
+    It 'uses dashes when there is nothing to report' {
+        (Format-ICTSummaryLine -Report (New-TestReport)).Split("`t") | Should -Be @('PC-0421', 'Compliant', '0', '0', '-', '-')
+    }
+}
+
+Describe 'Export-ICTReport' {
+    It 'writes JSON that round-trips' {
+        $path = Export-ICTReport -Report (New-TestReport) -OutputDirectory (Join-Path $TestDrive 'reports')
+        $path | Should -BeLike '*.json'
+        $json = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
         $json.ComputerName | Should -Be 'PC-0421'
         $json.OverallStatus | Should -Be 'Compliant'
         @($json.Evaluation.Results).Count | Should -BeGreaterThan 20
-
-        $html = Get-Content -LiteralPath ($files | Where-Object { $_ -like '*.html' }) -Raw
-        $html | Should -Match '&lt;script&gt;'
-        $html | Should -Not -Match '<script>alert'
     }
+}
 
-    It 'writes only the requested format' {
-        $files = @(Export-ICTReport -Report (New-TestReport) -OutputDirectory (Join-Path $TestDrive 'json-only') -Format Json)
-        $files.Count | Should -Be 1
-        $files[0] | Should -BeLike '*.json'
+Describe 'Next steps after a blocked repair' {
+    It 'suggests DeviceCredential, not -Force, when the re-enrollment itself refused' {
+        $remediation = [pscustomobject]@{
+            Status = 'Blocked'; WhatIf = $false; ChangesMade = $false; Sync = $null; LapsRetry = $null
+            Blockers = @('UserCredential enrollment needs an Entra or domain user signed in at the console (nobody is signed in at the console). Use -EnrollmentMethod DeviceCredential instead.')
+            ReEnrollment = [pscustomobject]@{ Status = 'Blocked'; Succeeded = $false; Message = 'x'; BackupPath = $null }
+            Steps = @([pscustomobject]@{ Name = 'Prerequisites'; Status = 'Fail'; Detail = 'nobody is signed in at the console' })
+        }
+        $text = Get-PlainText (Format-ICTReport -Report (New-TestReport -Change $brokenCertificate -Remediation $remediation) -Now $TestNow -NoColor -Width 120)
+        $text | Should -Match 'DeviceCredential'
+        $text | Should -Not -Match '-Force'
     }
 }

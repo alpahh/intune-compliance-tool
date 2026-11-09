@@ -20,6 +20,7 @@
                KeyProvider : Microsoft Platform Crypto Provider
               TpmProtected : YES
           DeviceAuthStatus : SUCCESS
+               KeySignTest : PASSED
 
 +----------------------------------------------------------------------+
 | Tenant Details                                                       |
