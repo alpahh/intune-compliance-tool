@@ -1,5 +1,5 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
     $script:fixtures = Join-Path $PSScriptRoot 'fixtures'
 }
 
@@ -40,6 +40,63 @@ Describe 'ConvertFrom-ICTDsregOutput' {
 
     It 'returns NotJoined for empty output' {
         InModuleScope IntuneComplianceTool { (ConvertFrom-ICTDsregOutput -Line @()).JoinType | Should -Be 'NotJoined' }
+    }
+}
+
+Describe 'ConvertFrom-ICTImeLog' {
+    It 'keeps only error entries inside the window, newest first' {
+        InModuleScope IntuneComplianceTool {
+            $now = [datetime]::new(2026, 11, 5, 12, 0, 0, [System.DateTimeKind]::Local)
+            $log = @(
+                '<![LOG[Started fine]LOG]!><time="08:00:01.1234567" date="11-5-2026" component="IntuneManagementExtension" context="" type="1" thread="1" file="">'
+                '<![LOG[Old failure]LOG]!><time="08:00:01.0" date="10-1-2026" component="AppWorkload" context="" type="3" thread="1" file="">'
+                "<![LOG[Download failed`nwith a second line]LOG]!><time=`"09:30:00.5`" date=`"11-5-2026`" component=`"AppWorkload`" context=`"`" type=`"3`" thread=`"1`" file=`"`">"
+                '<![LOG[A warning]LOG]!><time="10:00:00.0" date="11-5-2026" component="AgentExecutor" context="" type="2" thread="1" file="">'
+                '<![LOG[Script failed]LOG]!><time="10:30:00.0" date="11-5-2026" component="AgentExecutor" context="" type="3" thread="1" file="">'
+            ) -join "`n"
+            $result = ConvertFrom-ICTImeLog -Text @($log) -Days 7 -Now $now
+            $result.ErrorCount | Should -Be 2
+            $result.Recent[0].Message | Should -Be 'Script failed'
+            $result.Recent[0].Component | Should -Be 'AgentExecutor'
+            $result.Recent[1].Message | Should -Be 'Download failed with a second line'
+        }
+    }
+
+    It 'does not glue an informational entry onto a later error' {
+        InModuleScope IntuneComplianceTool {
+            $now = [datetime]::new(2026, 11, 5, 12, 0, 0, [System.DateTimeKind]::Local)
+            $log = '<![LOG[info]LOG]!><time="08:00:00.0" date="11-5-2026" component="A" type="1"><![LOG[bad]LOG]!><time="09:00:00.0" date="11-5-2026" component="B" type="3">'
+            $result = ConvertFrom-ICTImeLog -Text @($log) -Days 7 -Now $now
+            $result.ErrorCount | Should -Be 1
+            $result.Recent[0].Message | Should -Be 'bad'
+        }
+    }
+
+    It 'keeps truncated entries from merging with the next one' -TestCases @(
+        @{ Broken = '<![LOG[cut off in the header]LOG]!><time="12:00' }
+        @{ Broken = '<![LOG[cut off in the message' }
+    ) {
+        InModuleScope IntuneComplianceTool -Parameters @{ Broken = $Broken } {
+            $now = [datetime]::new(2026, 11, 5, 12, 0, 0, [System.DateTimeKind]::Local)
+            $log = $Broken + "`n" + '<![LOG[real error]LOG]!><time="09:00:00.0" date="11-5-2026" component="B" type="3">'
+            $result = ConvertFrom-ICTImeLog -Text @($log) -Days 7 -Now $now
+            $result.ErrorCount | Should -Be 1
+            $result.Recent[0].Message | Should -Be 'real error'
+        }
+    }
+
+    It 'reports how far back the logs go' {
+        InModuleScope IntuneComplianceTool {
+            $now = [datetime]::new(2026, 11, 5, 12, 0, 0, [System.DateTimeKind]::Local)
+            $log = '<![LOG[a]LOG]!><time="08:00:00.0" date="11-4-2026" component="A" type="1"><![LOG[b]LOG]!><time="09:00:00.0" date="11-5-2026" component="B" type="1">'
+            $result = ConvertFrom-ICTImeLog -Text @($log) -Days 7 -Now $now
+            $result.ErrorCount | Should -Be 0
+            $result.OldestEntry | Should -Be (ConvertTo-ICTIsoDate ([datetime]::new(2026, 11, 4, 8, 0, 0, [System.DateTimeKind]::Local)))
+        }
+    }
+
+    It 'handles no logs at all' {
+        InModuleScope IntuneComplianceTool { (ConvertFrom-ICTImeLog -Text @() -Days 7).ErrorCount | Should -Be 0 }
     }
 }
 

@@ -1,7 +1,7 @@
 # Shared constants and helpers. Everything in this file is platform-neutral so it
 # can be unit tested on any OS.
 
-$script:ICTVersion = '0.2.0'
+$script:ICTVersion = '0.3.0'
 $script:ICTIntuneProviderId = 'MS DM Server'
 $script:ICTGuidPattern = '^\{?[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}?$'
 $script:ICTLogPath = $null
@@ -188,6 +188,40 @@ function Get-ICTHttpProxyAddress {
     if ($server -match '(^|;)https=(?<p>[^;]+)') { return $Matches['p'] }
     if ($server -notmatch '=') { return ($server -split ';')[0] }
     return $null
+}
+
+function ConvertFrom-ICTImeLog {
+    <#
+        Error entries (type 3) of Intune Management Extension logs, which use the
+        CMTrace format: <![LOG[message]LOG]!><time="h:m:s.f" date="M-d-yyyy" component="c" ... type="n" ...>
+        Times in the log are local. Every entry is matched first and filtered afterwards,
+        and a message stops at the next entry, so entries can never run together.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Text = @(), [int]$Days = 7, [datetime]$Now = [datetime]::UtcNow, [int]$Keep = 10)
+
+    $pattern = '(?s)<!\[LOG\[(?<msg>(?:(?!\]LOG\]!>|<!\[LOG\[).)*)\]LOG\]!><time="(?<t>\d{1,2}:\d{2}:\d{2})[^"]*"\s+date="(?<d>\d{1,2}-\d{1,2}-\d{4})"\s+component="(?<c>[^"]*)"[^>]*?type="(?<type>\d)"'
+    $styles = [System.Globalization.DateTimeStyles]::AssumeLocal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    $cutoff = $Now.ToUniversalTime().AddDays(-$Days)
+    $errors = New-Object 'System.Collections.Generic.List[object]'
+    $oldest = $null
+    foreach ($block in $Text) {
+        foreach ($match in [regex]::Matches($block, $pattern)) {
+            $stamp = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact(('{0} {1}' -f $match.Groups['d'].Value, $match.Groups['t'].Value), 'M-d-yyyy H:mm:ss', $script:ICTInvariant, $styles, [ref]$stamp)) { continue }
+            if ($null -eq $oldest -or $stamp -lt $oldest) { $oldest = $stamp }
+            if ($match.Groups['type'].Value -ne '3' -or $stamp -lt $cutoff) { continue }
+            $message = ($match.Groups['msg'].Value -replace '\s+', ' ').Trim()
+            if ($message.Length -gt 300) { $message = $message.Substring(0, 300) }
+            $errors.Add([pscustomobject]@{ TimeCreated = ConvertTo-ICTIsoDate $stamp; Component = $match.Groups['c'].Value; Message = $message })
+        }
+    }
+    return [pscustomobject]@{
+        LookbackDays = $Days
+        OldestEntry  = ConvertTo-ICTIsoDate $oldest   # the logs rotate, so they may cover less than the window
+        ErrorCount   = $errors.Count
+        Recent       = @($errors | Sort-Object TimeCreated -Descending | Select-Object -First $Keep)
+    }
 }
 
 function Get-ICTEnrollmentRegistryPath {

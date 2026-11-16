@@ -47,7 +47,7 @@ function Format-ICTReport {
     $padLeft = [int][math]::Floor(($badgeInner - $badge.Text.Length) / 2)
     $badgeText = (' ' * $padLeft) + $badge.Text + (' ' * ($badgeInner - $badge.Text.Length - $padLeft))
 
-    $actionNames = @{ TimeSync = 'CLOCK'; ServiceFix = 'SERVICES'; ReEnroll = 'RE-ENROLL'; Sync = 'SYNC'; LapsRetry = 'LAPS RETRY' }
+    $actionNames = @{ TimeSync = 'CLOCK'; ServiceFix = 'SERVICES'; ReEnroll = 'RE-ENROLL'; Sync = 'SYNC'; LapsRetry = 'LAPS RETRY'; UpdateFix = 'UPDATES' }
     $actions = @($evaluation.RecommendedActions | ForEach-Object { $actionNames[$_] } | Where-Object { $_ })
     $sideWidth = $Width - $badgeInner - 7
     $recommended = 'Recommended: ' + $(if ($actions.Count -gt 0) { $actions -join ' + ' } else { 'nothing' })
@@ -56,12 +56,17 @@ function Format-ICTReport {
         $repairText = 'Repair possible: ' + $(if ($evaluation.CanRepairEnrollment) { 'yes' } else { 'no (see next steps)' })
     }
 
+    # A long list of actions continues on the next line instead of being cut off.
+    $side = @(Split-ICTText -Text $recommended -Width $sideWidth)
+    $extra = @($side | Select-Object -Skip 1)
+    if ($repairText) { $extra += & $color (Limit-ICTText -Text $repairText -Width $sideWidth -Theme $theme) 'Gray' }
     $lines.Add('')
     $lines.Add('  ' + (& $color ($s.HTL + ($s.HH * $badgeInner) + $s.HTR) $badge.Color))
-    $lines.Add('  ' + (& $color ($s.HV + $badgeText + $s.HV) $badge.Color) + '   ' + (Limit-ICTText -Text $recommended -Width $sideWidth -Theme $theme))
+    $lines.Add('  ' + (& $color ($s.HV + $badgeText + $s.HV) $badge.Color) + '   ' + $side[0])
     $bottom = '  ' + (& $color ($s.HBL + ($s.HH * $badgeInner) + $s.HBR) $badge.Color)
-    if ($repairText) { $bottom += '   ' + (& $color (Limit-ICTText -Text $repairText -Width $sideWidth -Theme $theme) 'Gray') }
+    if ($extra.Count) { $bottom += '   ' + $extra[0] }
     $lines.Add($bottom)
+    foreach ($more in @($extra | Select-Object -Skip 1)) { $lines.Add((' ' * ($badgeInner + 7)) + $more) }
     #endregion
 
     #region Device summary
@@ -125,7 +130,7 @@ function Format-ICTReport {
     $actualWidth = $Width - 4 - $symbolWidth - 2 - $nameWidth
     $detailIndent = 4 + $symbolWidth + 2
 
-    foreach ($category in 'Join', 'Enrollment', 'Health', 'Network', 'Security', 'LAPS') {
+    foreach ($category in 'Join', 'Enrollment', 'Health', 'Network', 'Security', 'Updates', 'LAPS') {
         $categoryResults = @($evaluation.Results | Where-Object { $_.Category -eq $category })
         if ($categoryResults.Count -eq 0) { continue }
         $lines.Add((Format-ICTSectionRule -Title $category -Width $Width -Theme $theme))
@@ -169,6 +174,16 @@ function Format-ICTReport {
         }
     }
     #endregion
+
+    if ($Detailed -and $data.ImeLog -and @($data.ImeLog.Recent).Count -gt 0) {
+        $lines.Add('')
+        $lines.Add('  ' + (& $color ('RECENT EXTENSION LOG ERRORS (latest of the last {0} days)' -f $data.ImeLog.LookbackDays) 'Bold'))
+        foreach ($entry in @($data.ImeLog.Recent)) {
+            $when = (Format-ICTRelativeTime $entry.TimeCreated -Now $utcNow).PadRight(12)
+            $text = Limit-ICTText -Text ('{0}: {1}' -f $entry.Component, $entry.Message) -Width ($Width - 4 - 12) -Theme $theme
+            $lines.Add('    ' + (& $color $when 'Gray') + $text)
+        }
+    }
 
     #region Collection errors
     $collectionErrors = @($data.CollectionErrors | Where-Object { $_ })
@@ -217,21 +232,30 @@ function Format-ICTReport {
         foreach ($blocker in @($Items)) { $next.Add("  $($s.Dot) $blocker") }
     }
     $selfBlocked = ($remediation -and $remediation.ReEnrollment -and $remediation.ReEnrollment.Status -eq 'Blocked')
-
-    switch ($remediationStatus) {
-        'WhatIf' { $next.Add("This was a preview. To apply it: $CommandHint -Remediate") }
-        'Blocked' {
+    $updateSelfBlocked = ($remediation -and $remediation.UpdateRepair -and $remediation.UpdateRepair.Status -eq 'Blocked')
+    $showBlockers = {
+        if (@($remediation.Blockers | Where-Object { $_ }).Count -gt 0) {
             & $addBlockers 'The enrollment repair was not started because of:' $remediation.Blockers
             if (-not $selfBlocked) { $next.Add("Fix these first, or try anyway with: $CommandHint -Remediate -Force") }
         }
+        if (@($remediation.UpdateBlockers | Where-Object { $_ }).Count -gt 0) {
+            & $addBlockers 'The Windows Update repair was not started because of:' $remediation.UpdateBlockers
+            if (-not $updateSelfBlocked) { $next.Add("Fix these first, or try anyway with: $CommandHint -Remediate -Force") }
+        }
+        if ($remediation.ChangesMade) { $next.Add('The other repairs ran; see REPAIR above.') }
+    }
+
+    switch ($remediationStatus) {
+        'WhatIf' { $next.Add("This was a preview. To apply it: $CommandHint -Remediate") }
+        'Blocked' { & $showBlockers }
         'Failed' {
             $next.Add('The repair did not complete.')
-            $parts = @($remediation.ReEnrollment, $remediation.LapsRetry)
+            $parts = @($remediation.ReEnrollment, $remediation.LapsRetry, $remediation.UpdateRepair)
             if (-not $remediation.ReEnrollment) { $parts += $remediation.Sync }   # after an escalation the sync result no longer matters
             foreach ($part in $parts) {
                 if ($part -and $part.Message -and -not $part.Succeeded -and $part.Status -ne 'Blocked') { $next.Add($part.Message) }
             }
-            if (@($remediation.Blockers).Count -gt 0) { & $addBlockers 'Not started because of:' $remediation.Blockers }
+            & $showBlockers
             if ($backupPath) { $next.Add("Backup of the removed enrollment: $backupPath") }
         }
         'Succeeded' {
@@ -266,7 +290,8 @@ function Format-ICTReport {
             }
             'Compliant' { if (@($actions | Where-Object { $_ -ne 'LapsRetry' }).Count -eq 0) { $next.Add('Nothing to do.') } }
         }
-        $quickFixes = @(@{ TimeSync = 'clock'; ServiceFix = 'services'; LapsRetry = 'LAPS' }.GetEnumerator() | Where-Object { $actions -contains $_.Key } | ForEach-Object { $_.Value } | Sort-Object)
+        $quickFixes = @(@{ TimeSync = 'clock'; ServiceFix = 'services'; LapsRetry = 'LAPS'; UpdateFix = 'Windows Update' }.GetEnumerator() | Where-Object { $actions -contains $_.Key } | ForEach-Object { $_.Value } | Sort-Object)
+        if ($remediation -and $remediation.UpdateRepair) { $quickFixes = @($quickFixes | Where-Object { $_ -ne 'Windows Update' }) }   # it just ran
         if ($quickFixes.Count -gt 0 -and $evaluation.OverallStatus -ne 'EnrollmentBroken') {
             $next.Add(('Repairable here ({0}): {1} -Remediate' -f ($quickFixes -join ', '), $CommandHint))
         }

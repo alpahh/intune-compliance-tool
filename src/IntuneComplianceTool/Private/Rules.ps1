@@ -1,4 +1,4 @@
-$script:ICTRuleCategory = @{ JOIN = 'Join'; ENR = 'Enrollment'; SVC = 'Health'; EVT = 'Health'; HLT = 'Health'; NET = 'Network'; SEC = 'Security'; LAPS = 'LAPS' }
+$script:ICTRuleCategory = @{ JOIN = 'Join'; ENR = 'Enrollment'; SVC = 'Health'; EVT = 'Health'; HLT = 'Health'; NET = 'Network'; SEC = 'Security'; UPD = 'Updates'; LAPS = 'LAPS' }
 
 # Auto-enrollment error codes (event 76) worth explaining. Blocks = re-enrolling would fail the same way.
 $script:ICTEnrollErrors = @{
@@ -14,7 +14,7 @@ function New-ICTRuleResult {
     <#
         One check result. The category comes from the Id prefix.
         Status: Pass | Fail | Warning | Unknown | Info
-        Action: the repair -Remediate runs for a Fail or Warning (TimeSync, ServiceFix, Sync, ReEnroll, LapsRetry).
+        Action: the repair -Remediate runs for a Fail or Warning (TimeSync, ServiceFix, Sync, ReEnroll, LapsRetry, UpdateFix).
         Blocks: for a Fail or Warning, the repairs this finding makes pointless: ReEnroll, or All (sync too).
     #>
     [CmdletBinding()]
@@ -25,7 +25,7 @@ function New-ICTRuleResult {
         [Parameter(Position = 3)][string]$Actual,
         [string]$Message,
         [string]$Remediation,
-        [ValidateSet('TimeSync', 'ServiceFix', 'Sync', 'ReEnroll', 'LapsRetry')][string]$Action,
+        [ValidateSet('TimeSync', 'ServiceFix', 'Sync', 'ReEnroll', 'LapsRetry', 'UpdateFix')][string]$Action,
         [ValidateSet('ReEnroll', 'All')][string]$Blocks
     )
 
@@ -51,6 +51,15 @@ function Format-ICTDate {
     $value = ConvertFrom-ICTDate $Date
     if ($null -eq $value) { return 'unknown' }
     return $value.ToString('yyyy-MM-dd', $script:ICTInvariant)
+}
+
+function Get-ICTIntuneWorkload {
+    <# Names of the co-management workloads moved to Intune. Bit 1 and the higher bits are baseline markers, not workloads. #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([int]$Flags)
+    $names = [ordered]@{ 2 = 'Compliance'; 4 = 'Resource access'; 8 = 'Device config'; 16 = 'Updates'; 32 = 'Endpoint protection'; 64 = 'Client apps'; 128 = 'Office apps' }
+    return [string[]]@(foreach ($bit in $names.Keys) { if ($Flags -band [int]$bit) { $names[[object]$bit] } })
 }
 
 function Get-ICTJoinRule {
@@ -225,6 +234,37 @@ function Get-ICTHealthRule {
         else { New-ICTRuleResult $id $label Pass ('{0} ({1})' -f $service.Status, $service.StartType) }
     }
 
+    $configMgr = $DeviceData.ConfigMgr
+    if ($configMgr -and $configMgr.ClientInstalled) {
+        $flags = [int]$configMgr.Workloads
+        $moved = Get-ICTIntuneWorkload -Flags $flags
+        if (-not $configMgr.WorkloadsReadable) { New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Info 'client installed, workloads unreadable' }
+        elseif ($moved.Count -eq 0) { New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Info 'client installed, no workloads in Intune' }
+        else {
+            $actual = 'co-managed, {0} workloads in Intune' -f $moved.Count
+            $list = 'Workloads in Intune: {0}.' -f ($moved -join ', ')
+            if ($flags -band 2) { New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Info $actual -Message $list }
+            else {
+                New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Warning $actual -Message "$list The compliance workload is with ConfigMgr, so Intune policies do not decide whether this device is compliant." `
+                    -Remediation 'Move the compliance policies workload to Intune, or check the ConfigMgr baselines.'
+            }
+        }
+    }
+
+    $ime = $DeviceData.ImeLog
+    $imeService = @($DeviceData.Services | Where-Object { $_ -and $_.Name -eq 'IntuneManagementExtension' -and $_.Present }) | Select-Object -First 1
+    if ($ime -and $imeService) {
+        # The logs rotate: name the period they really cover.
+        $oldest = ConvertFrom-ICTDate $ime.OldestEntry
+        $span = $(if ($oldest -and ($Now - $oldest).TotalDays -lt $ime.LookbackDays) { 'since ' + (Format-ICTRelativeTime $oldest -Now $Now) } else { 'in {0} days' -f $ime.LookbackDays })
+        if ($ime.ErrorCount -eq 0) { New-ICTRuleResult 'HLT-IME' 'Extension log' Pass "no errors $span" }
+        else {
+            $latest = @($ime.Recent) | Select-Object -First 1
+            New-ICTRuleResult 'HLT-IME' 'Extension log' Info ('{0} errors {1}, latest {2}' -f $ime.ErrorCount, $span, (Format-ICTRelativeTime $latest.TimeCreated -Now $Now)) `
+                -Message 'Errors from Win32 apps, scripts or remediations. Some are normal; run with -Detailed to see the latest.'
+        }
+    }
+
     $events = $DeviceData.MdmEvents
     if ($null -eq $events) { New-ICTRuleResult 'EVT-001' 'MDM error events' Unknown 'event log unavailable' }
     elseif ($events.ErrorCount -eq 0) { New-ICTRuleResult 'EVT-001' 'MDM error events' Pass ('none in {0} days' -f $events.LookbackDays) }
@@ -391,6 +431,134 @@ function Get-ICTSecurityRule {
                 New-ICTRuleResult 'SEC-007' 'Firewall' Fail (($off -join ', ') + ' off') -Message 'Windows Firewall is off for at least one profile (effective policy).' -Remediation 'Check the Intune firewall policy.'
             }
         }
+    }
+}
+
+function Get-ICTUpdateManager {
+    <# Who drives Windows Update when it is not Windows Update itself: ConfigMgr, WSUS or a blocking policy. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([psobject]$DeviceData)
+    $policy = $DeviceData.Updates.Policy
+    $configMgr = $DeviceData.ConfigMgr
+    if ($configMgr -and $configMgr.ClientInstalled -and -not ([int]$configMgr.Workloads -band 16)) { return 'ConfigMgr' }
+    if ($policy.WsusServer -and -not $policy.QualityFromWindowsUpdate) { return 'WSUS' }
+    if ($policy.DisableAccess -or $policy.NoAutoUpdate) { return 'policy' }
+    return $null
+}
+
+function Get-ICTUpdateRule {
+    [CmdletBinding()]
+    param([psobject]$DeviceData, [psobject]$Config, [datetime]$Now)
+
+    if (-not $Config.CheckWindowsUpdate) { return }
+    $updates = $DeviceData.Updates
+    if ($null -eq $updates) { New-ICTRuleResult 'UPD-SCAN' 'Last update scan' Unknown 'not checked'; return }
+    $fix = 'The tool resets the Windows Update components and starts a new scan (-Remediate).'
+    # The agent's scan and install dates are only kept by Windows Update's own automatic updates.
+    $managedBy = Get-ICTUpdateManager -DeviceData $DeviceData
+    $boot = ConvertFrom-ICTDate $DeviceData.Device.LastBootTime
+    $justStarted = ($boot -and ($Now - $boot).TotalHours -lt 24)
+    $lastReset = ConvertFrom-ICTDate $updates.LastReset
+
+    $services = $updates.Services
+    if ($null -eq $services) { New-ICTRuleResult 'UPD-SVC' 'Update services' Unknown 'could not read' }
+    else {
+        # UsoSvc does not exist on every build; the other three are essential.
+        $broken = @($services | Where-Object { $_ -and (($_.Present -and $_.StartType -eq 'Disabled') -or (-not $_.Present -and $_.Name -ne 'UsoSvc')) } |
+                ForEach-Object { '{0} {1}' -f $_.Name, $(if ($_.Present) { 'disabled' } else { 'missing' }) })
+        if ($broken.Count) {
+            New-ICTRuleResult 'UPD-SVC' 'Update services' Fail ($broken -join ', ') -Action UpdateFix -Message 'Windows Update cannot work while these services are disabled or missing.' -Remediation $fix
+        }
+        else { New-ICTRuleResult 'UPD-SVC' 'Update services' Pass 'enabled' }
+    }
+
+    $agent = $updates.Agent
+    if ($null -eq $agent -or -not $agent.Readable) {
+        New-ICTRuleResult 'UPD-SCAN' 'Last update scan' Unknown 'update agent not available' -Message $agent.Error
+    }
+    else {
+        $scan = ConvertFrom-ICTDate $agent.LastSearchSuccess
+        $scanText = $(if ($scan) { Format-ICTRelativeTime $scan -Now $Now } else { 'never' })
+        if ($managedBy) {
+            New-ICTRuleResult 'UPD-SCAN' 'Last update scan' Info ('{0} (updates via {1})' -f $scanText, $managedBy) -Message "Updates are driven by $managedBy, so the Windows Update agent's own dates are not judged."
+        }
+        elseif ($null -eq $scan -or ($Now - $scan).TotalDays -gt $Config.MaxUpdateScanAgeDays) {
+            $actual = $(if ($scan) { '{0} (limit {1} days)' -f $scanText, $Config.MaxUpdateScanAgeDays } else { 'never succeeded' })
+            if ($justStarted) {
+                New-ICTRuleResult 'UPD-SCAN' 'Last update scan' Warning ($actual + ', device just started') -Message 'The device was probably off; Windows Update scans on its own soon.'
+            }
+            else { New-ICTRuleResult 'UPD-SCAN' 'Last update scan' Fail $actual -Action UpdateFix -Message 'Windows Update has not found updates successfully for too long.' -Remediation $fix }
+        }
+        else { New-ICTRuleResult 'UPD-SCAN' 'Last update scan' Pass $scanText }
+
+        $install = ConvertFrom-ICTDate $agent.LastInstallSuccess
+        if ($null -eq $install) { New-ICTRuleResult 'UPD-INSTALL' 'Last update installed' Info 'none recorded' }
+        elseif ($managedBy) { New-ICTRuleResult 'UPD-INSTALL' 'Last update installed' Info ('{0} (updates via {1})' -f (Format-ICTRelativeTime $install -Now $Now), $managedBy) }
+        elseif (($Now - $install).TotalDays -gt $Config.MaxUpdateInstallAgeDays) {
+            # No repair: deferrals and pauses (up to 30 + 35 days) are legitimate reasons too.
+            New-ICTRuleResult 'UPD-INSTALL' 'Last update installed' Warning ('{0} (limit {1} days)' -f (Format-ICTRelativeTime $install -Now $Now), $Config.MaxUpdateInstallAgeDays) `
+                -Message 'No update was installed for a long time.' -Remediation 'Check the update ring for deferrals or a pause, and the failed updates below.'
+        }
+        else { New-ICTRuleResult 'UPD-INSTALL' 'Last update installed' Pass (Format-ICTRelativeTime $install -Now $Now) }
+    }
+
+    $history = $updates.History
+    if ($null -eq $history) { New-ICTRuleResult 'UPD-FAILED' 'Failed updates' Unknown 'could not read the update history' }
+    else {
+        # Only real failures; Defender definitions and KB5034441 (recovery partition) fail for reasons a reset cannot fix.
+        $ignored = 'KB2267602|KB4052623|KB915597|KB5034441'
+        $failed = @($history | Where-Object { $_ -and $_.ResultCode -eq 4 -and $_.Title -notmatch $ignored } | Sort-Object Date -Descending)
+        $updatesFailing = @($failed | ForEach-Object { if ($_.Title -match 'KB\d+') { $Matches[0] } else { $_.Title } } | Sort-Object -Unique)
+        if ($failed.Count -eq 0) {
+            if ($lastReset -and ($Now - $lastReset).TotalDays -lt $Config.UpdateHistoryDays) {
+                New-ICTRuleResult 'UPD-FAILED' 'Failed updates' Info ('none since the reset {0}' -f (Format-ICTRelativeTime $lastReset -Now $Now)) -Message 'Resetting Windows Update clears its update history.'
+            }
+            else { New-ICTRuleResult 'UPD-FAILED' 'Failed updates' Pass ('none in {0} days' -f $Config.UpdateHistoryDays) }
+        }
+        else {
+            $latest = $failed[0]
+            $name = $(if ($latest.Title -match 'KB\d+') { $Matches[0] } else { 'update' })
+            $actual = '{0} {1}, {2} failing in {3} days' -f $name, $latest.HResult, $updatesFailing.Count, $Config.UpdateHistoryDays
+            $extra = @{}
+            $componentErrors = @($failed | Where-Object { @($Config.UpdateRepairErrorCodes) -contains $_.HResult })
+            if ($componentErrors.Count -and -not $managedBy) { $extra.Action = 'UpdateFix'; $extra.Remediation = $fix }   # these codes point at broken update components
+            New-ICTRuleResult 'UPD-FAILED' 'Failed updates' Warning $actual @extra -Message ('Latest failure: {0}' -f $latest.Title)
+        }
+    }
+
+    $policy = $updates.Policy
+    if ($policy) {
+        if ($policy.WsusServer -and $updates.Wsus -and -not $updates.Wsus.Reachable) {
+            $wsusHost = Get-ICTUriHost $policy.WsusServer
+            if ($policy.QualityFromWindowsUpdate) {
+                New-ICTRuleResult 'UPD-SOURCE' 'Update source' Warning ('WSUS {0} unreachable' -f $wsusHost) -Message 'Quality updates come from Windows Update, but other update classes from this unreachable WSUS server.'
+            }
+            else {
+                New-ICTRuleResult 'UPD-SOURCE' 'Update source' Fail ('WSUS {0} unreachable' -f $wsusHost) `
+                    -Message 'A WSUS policy points to a server this device cannot reach, so it gets no updates. Often a leftover group policy on an Intune device.' `
+                    -Remediation 'Remove the WSUS settings from the group policy, or switch the device to Windows Update for Business.'
+            }
+        }
+        elseif ($policy.DisableAccess -or $policy.NoAutoUpdate) {
+            New-ICTRuleResult 'UPD-SOURCE' 'Update source' Warning $(if ($policy.DisableAccess) { 'Windows Update blocked by policy' } else { 'automatic updates off by policy' }) `
+                -Message 'A policy stops Windows Update from working normally.' -Remediation 'Check the Windows Update group policies and Intune update rings.'
+        }
+        elseif ($policy.WsusServer) { New-ICTRuleResult 'UPD-SOURCE' 'Update source' Info ('WSUS {0}' -f (Get-ICTUriHost $policy.WsusServer)) }
+        else { New-ICTRuleResult 'UPD-SOURCE' 'Update source' Info $(if ($policy.IntunePolicy) { 'Windows Update (Intune policy)' } else { 'Windows Update' }) }
+    }
+
+    $disk = $updates.Disk
+    if ($null -eq $disk) { New-ICTRuleResult 'UPD-DISK' 'Free disk space' Unknown 'could not read' }
+    else {
+        $actual = '{0} GB free of {1} GB' -f $disk.FreeGB, $disk.SizeGB
+        if ($disk.FreeGB -lt ($Config.MinFreeDiskGB / 2)) {
+            New-ICTRuleResult 'UPD-DISK' 'Free disk space' Fail $actual -Message 'Updates fail without enough free space.' -Remediation 'Free up space (Disk Cleanup, Storage Sense), then retry the updates.'
+        }
+        elseif ($disk.FreeGB -lt $Config.MinFreeDiskGB) {
+            New-ICTRuleResult 'UPD-DISK' 'Free disk space' Warning $actual -Message 'Feature updates need more free space.' -Remediation 'Free up space (Disk Cleanup, Storage Sense).'
+        }
+        else { New-ICTRuleResult 'UPD-DISK' 'Free disk space' Pass $actual }
     }
 }
 

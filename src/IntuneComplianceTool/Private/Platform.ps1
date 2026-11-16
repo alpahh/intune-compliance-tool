@@ -107,7 +107,9 @@ function Get-ICTAutoEnrollState {
     param()
     $policy = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\MDM' -ErrorAction SilentlyContinue
     $enrollments = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue
-    $last = @(Get-ICTWinEvent -LogName $script:ICTMdmLogName -XPath '*[System[(EventID=75 or EventID=76)]]' -MaxEvents 1) | Select-Object -First 1
+    $last = $null
+    try { $last = @(Get-ICTWinEvent -LogName $script:ICTMdmLogName -XPath '*[System[(EventID=75 or EventID=76)]]' -MaxEvents 1) | Select-Object -First 1 }
+    catch { Write-ICTLog -Level Warning "Could not read the auto-enrollment events: $($_.Exception.Message)" }
 
     $hresult = $null
     if ($last -and $last.Message -match '0x[0-9A-Fa-f]{8}') { $hresult = $Matches[0].ToLowerInvariant() }
@@ -202,6 +204,38 @@ function Get-ICTServiceState {
     }
 }
 
+function Get-ICTConfigMgrState {
+    <#
+        ConfigMgr client and its co-management workload bits (ComgmtWorkloads on CCM_System).
+        WorkloadsReadable is $false only when the WMI class could not be read at all.
+    #>
+    [CmdletBinding()]
+    param()
+    if ($null -eq (Get-Service -Name CcmExec -ErrorAction SilentlyContinue)) { return [pscustomobject]@{ ClientInstalled = $false; Workloads = $null; WorkloadsReadable = $true } }
+    try {
+        $system = Get-CimInstance -Namespace 'root\ccm\InvAgt' -ClassName CCM_System -ErrorAction Stop
+        if ($null -eq $system) { throw 'CCM_System has no instance.' }
+        return [pscustomobject]@{ ClientInstalled = $true; Workloads = $system.ComgmtWorkloads; WorkloadsReadable = $true }
+    }
+    catch {
+        Write-ICTLog -Level Warning "Could not read the co-management workloads: $($_.Exception.Message)"
+        return [pscustomobject]@{ ClientInstalled = $true; Workloads = $null; WorkloadsReadable = $false }
+    }
+}
+
+function Get-ICTImeLogText {
+    <# The recent part of each Intune Management Extension log written to within the last days. Throws if it cannot read them. #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([int]$Days = 7, [int]$TailLines = 5000)
+    $directory = Join-Path $env:ProgramData 'Microsoft\IntuneManagementExtension\Logs'
+    if (-not (Test-Path -LiteralPath $directory)) { throw "The log folder $directory does not exist." }
+    $cutoff = (Get-Date).AddDays(-$Days)
+    foreach ($file in Get-ChildItem -LiteralPath $directory -Filter '*.log' -File -ErrorAction Stop | Where-Object { $_.LastWriteTime -ge $cutoff }) {
+        (Get-Content -LiteralPath $file.FullName -Tail $TailLines -ErrorAction Stop) -join "`n"
+    }
+}
+
 function Get-ICTBitLockerState {
     [CmdletBinding()]
     param()
@@ -257,6 +291,91 @@ function Get-ICTFirewallState {
     foreach ($profile in Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop) {
         [pscustomobject]@{ Profile = $profile.Name; Enabled = ("$($profile.Enabled)" -eq 'True') }
     }
+}
+
+#endregion
+
+#region Windows Update
+
+function Get-ICTWindowsUpdateState {
+    <#
+        Windows Update agent: last successful scan and install (UTC), and whether it is
+        installing right now. Readable is $false when the agent cannot be asked, which is
+        the case while the wuauserv service is disabled (0x80070422).
+    #>
+    [CmdletBinding()]
+    param()
+    # The agent reports UTC dates, and nothing at all when it never succeeded.
+    $utc = { param($Value) if ($Value -is [datetime]) { ConvertTo-ICTIsoDate ([datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc)) } }
+    $state = [pscustomobject]@{ Readable = $true; Error = $null; LastSearchSuccess = $null; LastInstallSuccess = $null; InstallerBusy = $null }
+    try {
+        $results = (New-Object -ComObject 'Microsoft.Update.AutoUpdate').Results
+        $state.LastSearchSuccess = & $utc $results.LastSearchSuccessDate
+        $state.LastInstallSuccess = & $utc $results.LastInstallationSuccessDate
+    }
+    catch {
+        $state.Readable = $false
+        $state.Error = $_.Exception.GetBaseException().Message
+    }
+    try { $state.InstallerBusy = [bool](New-Object -ComObject 'Microsoft.Update.Installer').IsBusy }
+    catch { Write-ICTLog -Level Warning "Could not ask whether Windows Update is busy: $($_.Exception.Message)" }
+    return $state
+}
+
+function Get-ICTUpdateResetTime {
+    <# When this tool last reset the Windows Update components (newest SoftwareDistribution.ict-* copy), UTC. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    $latest = Get-ChildItem -LiteralPath $env:windir -Directory -Filter 'SoftwareDistribution.ict-*' -ErrorAction SilentlyContinue |
+        Sort-Object CreationTimeUtc -Descending | Select-Object -First 1
+    if ($latest) { return ConvertTo-ICTIsoDate $latest.CreationTimeUtc }
+}
+
+function Get-ICTUpdateHistory {
+    <# Update installations of the last days from the Windows Update history (dates are UTC). #>
+    [CmdletBinding()]
+    param([int]$Days = 30, [int]$MaxEntries = 200)
+    $searcher = (New-Object -ComObject 'Microsoft.Update.Session').CreateUpdateSearcher()
+    $count = $searcher.GetTotalHistoryCount()
+    if ($count -le 0) { return }
+    $cutoff = [datetime]::UtcNow.AddDays(-$Days)
+    foreach ($entry in @($searcher.QueryHistory(0, [math]::Min($count, $MaxEntries)))) {
+        if ($null -eq $entry -or $entry.Operation -ne 1 -or $null -eq $entry.Date) { continue }   # 1 = installation
+        $date = [datetime]::SpecifyKind([datetime]$entry.Date, [System.DateTimeKind]::Utc)
+        if ($date -lt $cutoff) { continue }
+        [pscustomobject]@{
+            Date       = ConvertTo-ICTIsoDate $date
+            Title      = "$($entry.Title)"
+            ResultCode = [int]$entry.ResultCode   # 2 succeeded, 3 succeeded with errors, 4 failed, 5 aborted
+            HResult    = '0x{0:x8}' -f ([int64]$entry.HResult -band 4294967295)   # as unsigned hex, like 0x800f0922
+        }
+    }
+}
+
+function Get-ICTUpdatePolicy {
+    <# Where updates come from: WSUS group policy, blocking policies, and whether Intune sets update policies. #>
+    [CmdletBinding()]
+    param()
+    $policy = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue
+    $au = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue
+    $mdm = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update' -ErrorAction SilentlyContinue
+    $servicing = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Servicing' -ErrorAction SilentlyContinue
+    return [pscustomobject]@{
+        WsusServer               = $(if ($au.UseWUServer -eq 1 -and $policy.WUServer) { [string]$policy.WUServer } else { $null })
+        QualityFromWindowsUpdate = ($policy.SetPolicyDrivenUpdateSourceForQualityUpdates -eq 0)   # 2004+: WSUS only for other classes
+        DisableAccess            = ($policy.DisableWindowsUpdateAccess -eq 1 -or $policy.DoNotConnectToWindowsUpdateInternetLocations -eq 1)
+        NoAutoUpdate             = ($au.NoAutoUpdate -eq 1)
+        RepairFromWindowsUpdate  = ($servicing.RepairContentServerSource -eq 2)
+        IntunePolicy             = ($null -ne $mdm -and $mdm.ValueCount -gt 0)
+    }
+}
+
+function Get-ICTSystemDisk {
+    [CmdletBinding()]
+    param()
+    $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive) -ErrorAction Stop
+    return [pscustomobject]@{ FreeGB = [math]::Round($disk.FreeSpace / 1GB, 1); SizeGB = [math]::Round($disk.Size / 1GB, 1) }
 }
 
 #endregion
@@ -479,6 +598,15 @@ function New-ICTDirectorySecurity {
     return $acl
 }
 
+function New-ICTRestrictedFolder {
+    <# Creates a folder that has the restricted ACL from the first moment. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $security = New-ICTDirectorySecurity
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $null = [System.IO.Directory]::CreateDirectory($Path, $security) }
+    else { [System.IO.FileSystemAclExtensions]::Create((New-Object System.IO.DirectoryInfo($Path)), $security) }
+}
+
 function Assert-ICTTrustedItem {
     <# Throws when an existing file or folder is a reparse point or owned by anyone but SYSTEM, Administrators or the current admin. #>
     [CmdletBinding()]
@@ -502,16 +630,13 @@ function Protect-ICTDirectory {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-ICTIsWindows)) { if (-not (Test-Path -LiteralPath $Path)) { $null = New-Item -Path $Path -ItemType Directory -Force }; return }
 
-    $security = New-ICTDirectorySecurity
-    if (-not (Test-Path -LiteralPath $Path)) {
-        $null = [System.IO.Directory]::CreateDirectory($Path, $security)
-        return
-    }
+    # A folder someone else created in between is caught by the checks below.
+    if (-not (Test-Path -LiteralPath $Path)) { New-ICTRestrictedFolder -Path $Path }
     $folder = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     Assert-ICTTrustedItem -Item $folder
     # Streamed, so a junction is rejected before Get-ChildItem could descend into it.
     Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop | ForEach-Object { Assert-ICTTrustedItem -Item $_ }
-    Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
+    Set-Acl -LiteralPath $Path -AclObject (New-ICTDirectorySecurity) -ErrorAction Stop
 }
 
 function New-ICTPrivateDirectory {
@@ -522,7 +647,7 @@ function New-ICTPrivateDirectory {
     Protect-ICTDirectory -Path $Parent
     $path = Join-Path $Parent ('{0}-{1}' -f $Prefix, [guid]::NewGuid().ToString('N').Substring(0, 8))
     if (Test-Path -LiteralPath $path) { throw "'$path' already exists." }
-    if (Test-ICTIsWindows) { $null = [System.IO.Directory]::CreateDirectory($path, (New-ICTDirectorySecurity)) }
+    if (Test-ICTIsWindows) { New-ICTRestrictedFolder -Path $path }
     else { $null = New-Item -Path $path -ItemType Directory }
     return $path
 }
@@ -581,12 +706,12 @@ function Start-ICTSystemScript {
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory)][string]$ScriptPath)
+    param([Parameter(Mandatory)][string]$ScriptPath, [ValidateRange(5, 1440)][int]$TimeLimitMinutes = 15)
     $taskName = $script:ICTSystemTaskPrefix + [guid]::NewGuid().ToString('N').Substring(0, 8)
     $powershell = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $action = New-ScheduledTaskAction -Execute $powershell -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $ScriptPath)
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest   # the name resolves on every display language
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes $TimeLimitMinutes)
     $null = Register-ScheduledTask -TaskName $taskName -TaskPath '\' -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop
     Start-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction Stop
     return $taskName
@@ -626,7 +751,9 @@ function Get-ICTLastRepairTime {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$RepairRoot)
     if (-not (Test-Path -LiteralPath $RepairRoot)) { return $null }
-    $latest = Get-ChildItem -LiteralPath $RepairRoot -Directory -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc -Descending | Select-Object -First 1
+    # Re-enrollment folders start with their timestamp; update repairs ("update-...") do not count.
+    $latest = Get-ChildItem -LiteralPath $RepairRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}-' } |
+        Sort-Object CreationTimeUtc -Descending | Select-Object -First 1
     if ($null -eq $latest -or -not (Test-Path -LiteralPath (Join-Path $latest.FullName 'repair-state.jsonl'))) { return $null }
     return $latest.CreationTimeUtc
 }

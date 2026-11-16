@@ -57,6 +57,8 @@ function New-TestDeviceData {
             [pscustomobject]@{ Name = 'dmwappushservice'; Present = $true; Status = 'Stopped'; StartType = 'Manual' }
             [pscustomobject]@{ Name = 'IntuneManagementExtension'; Present = $true; Status = 'Running'; StartType = 'Automatic' }
         )
+        ConfigMgr        = [pscustomobject]@{ ClientInstalled = $false; Workloads = $null; WorkloadsReadable = $true }
+        ImeLog           = [pscustomobject]@{ LookbackDays = 7; ErrorCount = 0; Recent = @() }
         Security         = [pscustomobject]@{
             BitLocker  = [pscustomobject]@{ MountPoint = 'C:'; ProtectionOn = $true; VolumeStatus = 'FullyEncrypted'; EncryptionMethod = 'XtsAes256' }
             Tpm        = [pscustomobject]@{ Present = $true; Ready = $true }
@@ -67,6 +69,20 @@ function New-TestDeviceData {
                 [pscustomobject]@{ Profile = 'Private'; Enabled = $true }
                 [pscustomobject]@{ Profile = 'Public'; Enabled = $true }
             )
+        }
+        Updates          = [pscustomobject]@{
+            Agent    = [pscustomobject]@{ Readable = $true; Error = $null; LastSearchSuccess = '2026-11-05T08:00:00Z'; LastInstallSuccess = '2026-10-20T03:00:00Z'; InstallerBusy = $false }
+            History  = @([pscustomobject]@{ Date = '2026-10-20T03:00:00Z'; Title = '2026-10 Cumulative Update (KB5066666)'; ResultCode = 2; HResult = '0x00000000' })
+            Services = @(
+                [pscustomobject]@{ Name = 'wuauserv'; Present = $true; Status = 'Running'; StartType = 'Manual' }
+                [pscustomobject]@{ Name = 'BITS'; Present = $true; Status = 'Stopped'; StartType = 'Manual' }
+                [pscustomobject]@{ Name = 'CryptSvc'; Present = $true; Status = 'Running'; StartType = 'Automatic' }
+                [pscustomobject]@{ Name = 'UsoSvc'; Present = $true; Status = 'Running'; StartType = 'Automatic' }
+            )
+            LastReset = $null
+            Policy   = [pscustomobject]@{ WsusServer = $null; QualityFromWindowsUpdate = $false; DisableAccess = $false; NoAutoUpdate = $false; RepairFromWindowsUpdate = $false; IntunePolicy = $true }
+            Wsus     = $null
+            Disk     = [pscustomobject]@{ FreeGB = 120.5; SizeGB = 237.9 }
         }
         Laps             = [pscustomobject]@{
             Configured = $true; PolicySource = 'Intune'; BackupTarget = 'EntraId'; AutomaticAccountManagement = $false; AutomaticAccountEnabled = $false

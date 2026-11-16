@@ -1,5 +1,5 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
     . (Join-Path $PSScriptRoot 'TestData.ps1')
 
     $script:ansi = [regex]"$([char]27)\[[0-9;]*m"
@@ -117,6 +117,16 @@ Describe 'Recommended actions in the badge' {
         $text = Get-PlainText (Format-ICTReport -Report (New-TestReport -Change $change) -Now $TestNow -NoColor)
         $text | Should -Match 'Recommended: CLOCK \+ SERVICES'
         $text | Should -Match 'Repairable here \(clock, services\)'
+    }
+}
+
+Describe 'Windows Update in the report' {
+    It 'shows the update group and names the repair' {
+        $change = { param($d) $d.Updates.Agent.LastSearchSuccess = '2026-10-01T00:00:00Z'; $d.Device.LastBootTime = '2026-11-01T00:00:00Z' }
+        $text = Get-PlainText (Format-ICTReport -Report (New-TestReport -Change $change) -Now $TestNow -NoColor)
+        $text | Should -Match ((([string][char]0x2500) * 2) + ' Updates')
+        $text | Should -Match 'Recommended: UPDATES'
+        $text | Should -Match 'Repairable here \(Windows Update\)'
     }
 }
 

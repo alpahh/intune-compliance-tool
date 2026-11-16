@@ -4,7 +4,8 @@ function Invoke-ICTRemediation {
         Runs the repairs an evaluation recommends.
     .DESCRIPTION
         Order: TimeSync (w32tm resync), ServiceFix (re-enable / start MDM services),
-        then the enrollment repair, then LapsRetry.
+        then the enrollment repair, then LapsRetry, then UpdateFix (Windows Update reset;
+        with -RepairComponentStore also DISM and SFC).
         Enrollment: a stale check-in gets a sync first; if the sync does not produce a
         successful check-in, it escalates to a re-enrollment (EscalateSyncToReEnroll).
         A broken enrollment goes straight to re-enrollment. Blockers stop the
@@ -21,6 +22,7 @@ function Invoke-ICTRemediation {
         [string[]]$ExcludeAccount = @(),
         [string]$WorkDirectory,
         [switch]$Force,
+        [switch]$RepairComponentStore,
         [scriptblock]$OnProgress
     )
 
@@ -31,8 +33,8 @@ function Invoke-ICTRemediation {
     $steps = New-Object 'System.Collections.Generic.List[object]'
     $state = @{ Failed = $false; Blocked = $false; Changed = $false }
     $result = [pscustomobject]@{
-        WhatIf = $preview; Status = 'NothingToDo'; Blockers = @(); ChangesMade = $false
-        Sync = $null; ReEnrollment = $null; LapsRetry = $null; Steps = $null
+        WhatIf = $preview; Status = 'NothingToDo'; Blockers = @(); UpdateBlockers = @(); ChangesMade = $false
+        Sync = $null; ReEnrollment = $null; LapsRetry = $null; UpdateRepair = $null; Steps = $null
     }
     # Runs one repair: records its steps, and a failure instead of throwing.
     $run = {
@@ -135,6 +137,27 @@ function Invoke-ICTRemediation {
     elseif ($enrollmentAction -eq 'ReEnroll') { & $reEnroll }
 
     if ($actions -contains 'LapsRetry') { $result.LapsRetry = & $run 'LAPS retry' { Invoke-ICTLapsRetry -WhatIf:$preview -Confirm:$false } }
+
+    if ($actions -contains 'UpdateFix') {
+        $updateBlockers = @($Evaluation.UpdateBlockers)
+        if ($updateBlockers.Count -gt 0 -and -not $Force) {
+            $state.Blocked = $true
+            $result.UpdateBlockers = $updateBlockers
+            $steps.Add((New-ICTStep 'Update repair' Fail ('blocked: {0}' -f ($updateBlockers -join '; '))))
+        }
+        else {
+            if ($updateBlockers.Count -gt 0) { $steps.Add((New-ICTStep 'Blockers' Warning ('ignored (-Force): {0}' -f ($updateBlockers -join '; ')))) }
+            $timeout = $(if ($RepairComponentStore) { $Config.UpdateDeepRepairTimeoutSeconds } else { $Config.UpdateRepairTimeoutSeconds })
+            $result.UpdateRepair = & $run 'Update repair' {
+                Invoke-ICTUpdateRepair -Deep:$RepairComponentStore -ScriptTimeoutSeconds $timeout -ScanTimeoutSeconds $Config.UpdateScanTimeoutSeconds `
+                    -OnProgress $OnProgress -WhatIf:$preview -Confirm:$false
+            }
+            if ($result.UpdateRepair.Status -eq 'Blocked') {
+                $state.Blocked = $true
+                $result.UpdateBlockers = @($result.UpdateRepair.Message)
+            }
+        }
+    }
 
     $result.ChangesMade = $state.Changed
     $result.Status = $(if ($state.Failed) { 'Failed' } elseif ($state.Blocked) { 'Blocked' } elseif ($preview) { 'WhatIf' } else { 'Succeeded' })

@@ -12,8 +12,8 @@ function Test-ICTCompliance {
           Compliant         no failures and no unknowns (warnings and info are allowed)
 
         RecommendedActions, in the order -Remediate runs them:
-          TimeSync, ServiceFix, Sync or ReEnroll, LapsRetry
-        ReEnrollBlockers / SyncBlockers: findings that make that repair pointless.
+          TimeSync, ServiceFix, Sync or ReEnroll, LapsRetry, UpdateFix
+        ReEnrollBlockers / SyncBlockers / UpdateBlockers: findings that make that repair pointless or risky.
     #>
     [CmdletBinding()]
     param(
@@ -32,12 +32,13 @@ function Test-ICTCompliance {
             Get-ICTHealthRule -DeviceData $DeviceData -Config $Config -Now $utcNow
             Get-ICTNetworkRule -DeviceData $DeviceData -Config $Config
             Get-ICTSecurityRule -DeviceData $DeviceData -Config $Config
+            Get-ICTUpdateRule -DeviceData $DeviceData -Config $Config -Now $utcNow
             Get-ICTLapsRule -DeviceData $DeviceData -Config $Config -Now $utcNow
         )
 
         $wanted = @($results | Where-Object { $_.Action } | ForEach-Object { $_.Action } | Sort-Object -Unique)
         if ($wanted -contains 'ReEnroll') { $wanted = @($wanted | Where-Object { $_ -ne 'Sync' }) }
-        $actions = @('TimeSync', 'ServiceFix', 'ReEnroll', 'Sync', 'LapsRetry' | Where-Object { $wanted -contains $_ })
+        $actions = @('TimeSync', 'ServiceFix', 'ReEnroll', 'Sync', 'LapsRetry', 'UpdateFix' | Where-Object { $wanted -contains $_ })
 
         $describe = { '{0}: {1}' -f $_.Name, $_.Actual }
         $syncBlockers = @($results | Where-Object { $_.Blocks -eq 'All' } | ForEach-Object $describe)
@@ -46,6 +47,25 @@ function Test-ICTCompliance {
             $syncBlockers += 'Session: not running as administrator'
             $reEnrollBlockers += 'Session: not running as administrator'
         }
+
+        # Also without a ReEnroll recommendation: a sync that fails can escalate to a re-enrollment.
+        if ($DeviceData.ConfigMgr.ClientInstalled) {
+            if (-not $DeviceData.ConfigMgr.WorkloadsReadable) { $reEnrollBlockers += 'ConfigMgr: the co-management state could not be read' }
+            elseif (@(Get-ICTIntuneWorkload -Flags ([int]$DeviceData.ConfigMgr.Workloads)).Count -gt 0) { $reEnrollBlockers += 'Co-management: ConfigMgr controls the MDM enrollment of this device' }
+        }
+
+        # Resetting Windows Update while it installs, or while installed updates wait for a reboot, can break them.
+        # A reset also cannot help while the update source is unreachable or blocked, and needs time to recover.
+        $updateBlockers = @()
+        if ($DeviceData.PendingReboot.Pending) { $updateBlockers += 'Pending reboot: restart the device first' }
+        if ($DeviceData.Updates.Agent.InstallerBusy -eq $true) { $updateBlockers += 'Windows Update: installing right now' }
+        $source = $results | Where-Object { $_.Id -eq 'UPD-SOURCE' -and ($_.Status -eq 'Fail' -or $_.Actual -like '*blocked*') } | Select-Object -First 1
+        if ($source) { $updateBlockers += '{0}: {1}' -f $source.Name, $source.Actual }
+        $lastReset = ConvertFrom-ICTDate $DeviceData.Updates.LastReset
+        if ($lastReset -and ($utcNow - $lastReset).TotalHours -lt $Config.UpdateResetCooldownHours) {
+            $updateBlockers += 'Windows Update: reset {0}, give it time to recover' -f (Format-ICTRelativeTime $lastReset -Now $utcNow)
+        }
+        if ($DeviceData.IsElevated -eq $false) { $updateBlockers += 'Session: not running as administrator' }
 
         $enrollmentAction = @($actions | Where-Object { $_ -eq 'ReEnroll' -or $_ -eq 'Sync' }) | Select-Object -First 1
         $blockers = $(if ($enrollmentAction -eq 'Sync') { $syncBlockers } else { $reEnrollBlockers })
@@ -66,6 +86,7 @@ function Test-ICTCompliance {
             Blockers            = @($(if ($enrollmentAction) { $blockers }))
             ReEnrollBlockers    = $reEnrollBlockers
             SyncBlockers        = $syncBlockers
+            UpdateBlockers      = $updateBlockers
             Summary             = [pscustomobject]$summary
             Results             = $results
         }

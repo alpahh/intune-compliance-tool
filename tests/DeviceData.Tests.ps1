@@ -1,7 +1,7 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
     . (Join-Path $PSScriptRoot 'TestData.ps1')
-    $script:dsregLines = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures' 'dsregcmd-hybrid.txt')
+    $script:dsregLines = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/dsregcmd-hybrid.txt')
     $script:enrollmentId = '8C2F41D0-5B7A-4E21-9C3D-2A6B8F1E7D45'
 }
 
@@ -26,11 +26,18 @@ Describe 'Get-ICTDeviceData' {
         }
         Mock -ModuleName $m Get-ICTOmadmConnectionInfo { [pscustomobject]@{ ServerLastSuccessTime = '2026-11-05T12:15:00Z' } }
         Mock -ModuleName $m Get-ICTServiceState { foreach ($n in $Name) { [pscustomobject]@{ Name = $n; Present = $true; Status = 'Running'; StartType = 'Automatic' } } }
+        Mock -ModuleName $m Get-ICTConfigMgrState { [pscustomobject]@{ ClientInstalled = $false; Workloads = $null; WorkloadsReadable = $true } }
+        Mock -ModuleName $m Get-ICTImeLogText { }
         Mock -ModuleName $m Get-ICTBitLockerState { [pscustomobject]@{ ProtectionOn = $true } }
         Mock -ModuleName $m Get-ICTTpmState { [pscustomobject]@{ Present = $true; Ready = $true } }
         Mock -ModuleName $m Get-ICTSecureBootState { [pscustomobject]@{ Supported = $true; Enabled = $true } }
         Mock -ModuleName $m Get-ICTDefenderState { [pscustomobject]@{ AMServiceEnabled = $true; RealTimeProtectionEnabled = $true } }
         Mock -ModuleName $m Get-ICTFirewallState { [pscustomobject]@{ Profile = 'Domain'; Enabled = $true } }
+        Mock -ModuleName $m Get-ICTUpdatePolicy { [pscustomobject]@{ WsusServer = 'http://wsus.contoso.local:8530'; DisableAccess = $false; NoAutoUpdate = $false; IntunePolicy = $false } }
+        Mock -ModuleName $m Get-ICTWindowsUpdateState { [pscustomobject]@{ LastSearchSuccess = '2026-11-05T08:00:00Z'; LastInstallSuccess = '2026-10-20T03:00:00Z'; InstallerBusy = $false } }
+        Mock -ModuleName $m Get-ICTUpdateHistory { }
+        Mock -ModuleName $m Get-ICTSystemDisk { [pscustomobject]@{ FreeGB = 50; SizeGB = 250 } }
+        Mock -ModuleName $m Get-ICTUpdateResetTime { }
         Mock -ModuleName $m Get-ICTLapsPolicy { [pscustomobject]@{ Source = 'Intune'; BackupDirectory = 1; AdministratorAccountName = 'masteruser' } }
         Mock -ModuleName $m Get-ICTLocalAccount { [pscustomobject]@{ Name = $Name; Exists = $true; Enabled = $true; IsAdministrator = $true } }
         Mock -ModuleName $m Get-ICTLapsLastPasswordUpdate { '2026-11-02T09:00:00Z' }
@@ -38,6 +45,30 @@ Describe 'Get-ICTDeviceData' {
         Mock -ModuleName $m Get-ICTWinHttpProxy { [pscustomobject]@{ ProxyConfigured = $false } }
         Mock -ModuleName $m Test-ICTTcpEndpoint { foreach ($h in $HostName) { [pscustomobject]@{ HostName = $h; Port = $Port; Reachable = $true; Error = $null } } }
         Mock -ModuleName $m Get-ICTClockOffset { 2 }
+    }
+
+    It 'reads the extension log only when the extension is installed' {
+        Mock -ModuleName IntuneComplianceTool Get-ICTServiceState { foreach ($n in $Name) { [pscustomobject]@{ Name = $n; Present = ($n -ne 'IntuneManagementExtension'); Status = 'Running'; StartType = 'Automatic' } } }
+        $data = Get-ICTDeviceData
+        $data.ImeLog | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Get-ICTImeLogText -Times 0 -Exactly
+    }
+
+    It 'collects the Windows Update state and tests the WSUS server from the policy' {
+        $data = Get-ICTDeviceData
+        $data.Updates.Agent.LastSearchSuccess | Should -Be '2026-11-05T08:00:00Z'
+        $null -eq $data.Updates.History | Should -BeFalse -Because 'no history entries is an empty list, not "unreadable"'
+        @($data.Updates.Services).Count | Should -Be 4
+        $data.Updates.Wsus.HostName | Should -Be 'wsus.contoso.local'
+        $data.Updates.Wsus.Port | Should -Be 8530
+        $data.Updates.Disk.FreeGB | Should -Be 50
+    }
+
+    It 'skips Windows Update when it is turned off in the config' {
+        $config = Get-ICTConfig
+        $config.CheckWindowsUpdate = $false
+        (Get-ICTDeviceData -Config $config).Updates | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Get-ICTWindowsUpdateState -Times 0 -Exactly
     }
 
     It 'refuses to run on anything but Windows' {
@@ -75,7 +106,7 @@ Describe 'Get-ICTDeviceData' {
         $hosts | Should -Contain 'login.microsoftonline.com'
         $hosts | Should -Contain 'discovery.contoso.example'
         @($hosts | Where-Object { $_ -eq 'enrollment.manage.microsoft.com' }).Count | Should -Be 1
-        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Test-ICTTcpEndpoint -Times 1 -Exactly
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Test-ICTTcpEndpoint -Times 1 -Exactly -ParameterFilter { $Port -eq 443 }
     }
 
     It 'keeps "none found" apart from "could not read"' {
@@ -121,7 +152,7 @@ Describe 'Get-ICTDeviceData' {
         $script:progress = New-Object System.Collections.Generic.List[string]
         Mock -ModuleName IntuneComplianceTool Get-ICTTpmState { throw 'TPM error' }
         $null = Get-ICTDeviceData -OnProgress { param($Name, $Succeeded) $script:progress.Add("$Name=$Succeeded") }
-        $progress | Should -Be @('Device=True', 'Join=True', 'Enrollment=True', 'Services=True', 'Security=False', 'LAPS=True', 'Network=True', 'Event log=True')
+        $progress | Should -Be @('Device=True', 'Join=True', 'Enrollment=True', 'Services=True', 'Security=False', 'Updates=True', 'LAPS=True', 'Network=True', 'Event log=True')
     }
 
     It 're-checks only the requested sections and keeps the rest' {
