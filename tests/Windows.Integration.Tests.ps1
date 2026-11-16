@@ -280,9 +280,9 @@ Describe 'Windows Update reset as SYSTEM' -Tag 'Windows' -Skip:(-not $runSystem)
         $middle = Join-Path $env:windir 'SoftwareDistribution.ict-20000102-000000'
         try {
             # Two earlier copies: the first (original data) must stay, the one in between must go.
-            $null = New-Item -Path $oldest -ItemType Directory -Force
-            Start-Sleep -Seconds 1
-            $null = New-Item -Path $middle -ItemType Directory -Force
+            # A renamed folder keeps the creation time of the original, so the copies get old dates.
+            (New-Item -Path $oldest -ItemType Directory -Force).CreationTime = [datetime]'2000-01-01'
+            (New-Item -Path $middle -ItemType Directory -Force).CreationTime = [datetime]'2000-01-02'
             # The CI runner image disables wuauserv: the repair must turn it back on.
             & sc.exe config wuauserv start= disabled | Out-Null
 
