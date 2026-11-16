@@ -101,7 +101,7 @@ contains 'hint names the host' "$wrapper" "-CommandHint './ict.sh ok1'"
 contains 'wrapper removes the script' "$wrapper" 'Remove-Item -LiteralPath $p'
 lacks 'cmd.exe gets no exit suffix' "$(grep -- '-EncodedCommand' "$FAKE_LOG")" 'exit $LASTEXITCODE'
 
-FAKE_SHELL=ps run ok1
+FAKE_SHELL='ps' run ok1
 contains 'a PowerShell default shell gets the exit suffix' "$(grep -- '-EncodedCommand' "$FAKE_LOG")" '; exit $LASTEXITCODE'
 
 run ok1 -Force "$(printf 'O\xe2\x80\x99Neil')"

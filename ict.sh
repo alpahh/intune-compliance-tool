@@ -59,7 +59,14 @@ fi
 
 # A short base path: macOS limits socket paths to 104 bytes, and ssh adds a 17-character suffix.
 work_dir="$(mktemp -d /tmp/ict.XXXXXX)"
-trap 'for s in "$work_dir"/c*; do [[ -S "$s" ]] && ssh -o ControlPath="$s" -O exit x >/dev/null 2>&1; done; rm -rf "$work_dir"' EXIT
+cleanup() {
+  local socket
+  for socket in "$work_dir"/c*; do
+    [[ -S "$socket" ]] && ssh -o ControlPath="$socket" -O exit x > /dev/null 2>&1
+  done
+  rm -rf "$work_dir"
+}
+trap cleanup EXIT
 
 # PowerShell single-quoted literal (a variable for the quote: bash 3.2 mangles it inline).
 ps_quote() { local q="'"; local v="${1//$q/$q$q}"; printf "'%s'" "$v"; }
