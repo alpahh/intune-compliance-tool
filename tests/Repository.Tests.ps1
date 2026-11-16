@@ -6,6 +6,7 @@ BeforeDiscovery {
     $script:sourceFiles = @(
         Get-Item -LiteralPath (Join-Path $root 'IntuneComplianceTool.ps1')
         Get-ChildItem -Path (Join-Path $root 'src') -Recurse -Include '*.ps1', '*.psm1', '*.psd1' -File
+        Get-ChildItem -Path (Join-Path $root 'tests') -Recurse -Include '*.ps1' -File
     ) | ForEach-Object { @{ Path = $_.FullName; Name = $_.FullName.Substring($root.Length + 1) } }
 }
 
@@ -44,9 +45,10 @@ Describe 'Source file <Name>' -ForEach $sourceFiles {
         @($ps7Only | ForEach-Object { '{0} (line {1})' -f $_.Extent.Text, $_.Extent.StartLineNumber }) | Should -BeNullOrEmpty
 
         $text = [System.IO.File]::ReadAllText($Path)
-        $text | Should -Not -Match '-AsHashtable' -Because 'ConvertFrom-Json -AsHashtable does not exist in 5.1'
-        $text | Should -Not -Match 'ForEach-Object\s+-Parallel'
-        $text | Should -Not -Match '`e\[' -Because 'the `e escape does not exist in 5.1'
+        # Patterns are split so this file does not match itself.
+        $text | Should -Not -Match ('-As' + 'Hashtable') -Because 'that ConvertFrom-Json switch does not exist in 5.1'
+        $text | Should -Not -Match ('ForEach-Object\s+-Par' + 'allel')
+        $text | Should -Not -Match ('`' + 'e\[') -Because 'the backtick-e escape does not exist in 5.1'
     }
 }
 

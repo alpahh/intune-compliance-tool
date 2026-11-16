@@ -8,7 +8,8 @@
        security, LAPS, network, clock and event log data (read-only).
     2. Evaluates it and shows the result in the terminal.
     3. With -Remediate: resyncs the clock, fixes MDM services, syncs or re-enrolls,
-       retries LAPS - whatever the evaluation recommends - then checks again.
+       retries LAPS, resets Windows Update - whatever the evaluation recommends -
+       then checks again.
 
     Exit codes: 0 compliant, 1 not compliant or indeterminate, 2 enrollment broken
     (not repaired), 3 repair attempted but failed, 10 error.
@@ -19,6 +20,9 @@
 .PARAMETER Force
     Start the enrollment repair even when blockers were found (e.g. an unreachable
     endpoint). The re-enrollment's own safety checks still apply.
+.PARAMETER RepairComponentStore
+    With -Remediate: when Windows Update needs a repair, also run DISM /RestoreHealth
+    and sfc /scannow (can take an hour; runs as SYSTEM, so the SSH session may end).
 .PARAMETER EnrollmentMethod
     UserCredential (needs an Entra or domain user signed in at the console) or
     DeviceCredential. Default from the settings: UserCredential.
@@ -51,6 +55,7 @@
 param(
     [switch]$Remediate,
     [switch]$Force,
+    [switch]$RepairComponentStore,
     [ValidateSet('UserCredential', 'DeviceCredential')][string]$EnrollmentMethod,
     [switch]$Detailed,
     [switch]$Json,
@@ -140,11 +145,12 @@ try {
         $exclude = @($data.RunAs, $data.Laps.Account.Name, $config.LapsExpectedAccount | Where-Object { $_ })
         if (-not $quiet) { Write-Host '' }
         $remediation = Invoke-ICTRemediation -Evaluation $evaluation -Config $config -Method $method -ExcludeAccount $exclude `
-            -Force:$Force -OnProgress $onRepairProgress -WhatIf:$preview -Confirm:$false
+            -Force:$Force -RepairComponentStore:$RepairComponentStore -OnProgress $onRepairProgress -WhatIf:$preview -Confirm:$false
         if (-not $quiet) { Write-Host ("`r" + (' ' * 78) + "`r") -NoNewline }
         if ($remediation.ChangesMade) {
             $recheck = @('Enrollment', 'Services', 'LAPS', 'Event log')
             if (@($evaluation.RecommendedActions) -contains 'TimeSync') { $recheck += 'Network' }
+            if (@($evaluation.RecommendedActions) -contains 'UpdateFix') { $recheck += 'Updates' }
             $postData = & $collect 'Re-checking' $config $recheck $data
             $postEvaluation = Test-ICTCompliance -DeviceData $postData -Config $config
         }

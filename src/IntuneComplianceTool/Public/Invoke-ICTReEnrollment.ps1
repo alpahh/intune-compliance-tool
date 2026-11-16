@@ -164,25 +164,10 @@ function Invoke-ICTReEnrollment {
     # The SYSTEM task finishes on its own; Ctrl+C here would only abandon the monitoring.
     $previousCtrlC = Set-ICTCtrlCAsInput -Enabled $true
     try {
-        $final = $null
-        $lines = @()
-        $stopped = $null
-        $attempts = [int][math]::Ceiling($ScriptTimeoutSeconds / $PollIntervalSeconds)
-        for ($i = 1; $i -le $attempts -and -not $final -and -not $stopped; $i++) {
-            Start-Sleep -Seconds $PollIntervalSeconds
-            $lines = @(Get-ICTSystemScriptState -Path $statePath)
-            $final = $lines | Where-Object { $_.Stage -eq 'end' } | Select-Object -Last 1
-            if (-not $final) {
-                $task = Get-ICTSystemTaskState -TaskName $taskName
-                if ($null -eq $task -or ($task.State -ne 'Running' -and $task.State -ne 'Queued')) {
-                    $lines = @(Get-ICTSystemScriptState -Path $statePath)   # it may have finished just now
-                    $final = $lines | Where-Object { $_.Stage -eq 'end' } | Select-Object -Last 1
-                    if (-not $final) { $stopped = $(if ($task) { $task } else { [pscustomobject]@{ State = 'missing'; LastTaskResult = $null } }) }
-                }
-            }
-            $last = $lines | Select-Object -Last 1
-            & $progress ('repair as SYSTEM: {0} ({1} s)' -f $(if ($last) { $last.Stage } else { 'starting' }), ($i * $PollIntervalSeconds))
-        }
+        $wait = Wait-ICTSystemScript -TaskName $taskName -StatePath $statePath -TimeoutSeconds $ScriptTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -OnProgress $OnProgress
+        $lines = @($wait.Lines)
+        $final = $wait.Final
+        $stopped = $wait.Stopped
 
         $stageNames = @{ tasks = 'Remove tasks'; registry = 'Remove registry keys'; certificates = 'Remove certificates'; enroll = 'Enroll (as SYSTEM)' }
         foreach ($line in @($lines | Where-Object { $stageNames.ContainsKey([string]$_.Stage) })) {

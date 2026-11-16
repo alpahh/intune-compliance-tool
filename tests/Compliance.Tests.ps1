@@ -27,7 +27,7 @@ Describe 'Test-ICTCompliance' {
 
         It 'covers every check group and derives the category from the id' {
             $evaluation = & $evaluate
-            @($evaluation.Results | ForEach-Object { $_.Category } | Sort-Object -Unique) | Should -Be @('Enrollment', 'Health', 'Join', 'LAPS', 'Network', 'Security')
+            @($evaluation.Results | ForEach-Object { $_.Category } | Sort-Object -Unique) | Should -Be @('Enrollment', 'Health', 'Join', 'LAPS', 'Network', 'Security', 'Updates')
             (Get-Result $evaluation 'HLT-REBOOT').Category | Should -Be 'Health'
             (Get-Result $evaluation 'NET-TIME').Category | Should -Be 'Network'
         }
@@ -322,6 +322,172 @@ Describe 'Test-ICTCompliance' {
         It 'shows a capped MDM error count with a plus' {
             $data.MdmEvents = [pscustomobject]@{ LookbackDays = 7; ErrorCount = 100; Truncated = $true; Recent = @([pscustomobject]@{ TimeCreated = '2026-11-05T12:32:00Z'; Id = 404; Message = 'x' }) }
             (Get-Result (& $evaluate) 'EVT-001').Actual | Should -Be '100+ in 7 days, latest 2 h ago'
+        }
+    }
+
+    Context 'Windows Update' {
+        BeforeEach { $data.Device.LastBootTime = '2026-11-01T00:00:00Z' }   # running for days, so an old scan is not just "was off"
+
+        It 'is healthy with a recent scan and install' {
+            $evaluation = & $evaluate
+            (Get-Result $evaluation 'UPD-SCAN').Actual | Should -Be '6 h ago'
+            (Get-Result $evaluation 'UPD-SOURCE').Actual | Should -Be 'Windows Update (Intune policy)'
+            (Get-Result $evaluation 'UPD-DISK').Actual | Should -Be '120.5 GB free of 237.9 GB'
+            @($evaluation.Results | Where-Object { $_.Category -eq 'Updates' -and $_.Status -in 'Fail', 'Warning' }).Count | Should -Be 0
+        }
+
+        It 'repairs Windows Update when the last successful scan is too old' {
+            $data.Updates.Agent.LastSearchSuccess = '2026-10-01T00:00:00Z'
+            $evaluation = & $evaluate
+            (Get-Result $evaluation 'UPD-SCAN').Status | Should -Be 'Fail'
+            $evaluation.RecommendedActions | Should -Be @('UpdateFix')
+            $evaluation.OverallStatus | Should -Be 'NonCompliant'
+        }
+
+        It 'repairs Windows Update when it never scanned successfully' {
+            $data.Updates.Agent.LastSearchSuccess = $null
+            (Get-Result (& $evaluate) 'UPD-SCAN').Actual | Should -Be 'never succeeded'
+        }
+
+        It 'repairs disabled update services' {
+            $data.Updates.Services[0].StartType = 'Disabled'
+            $result = Get-Result (& $evaluate) 'UPD-SVC'
+            $result.Actual | Should -Be 'wuauserv disabled'
+            $result.Action | Should -Be 'UpdateFix'
+        }
+
+        It 'counts failed updates by update and repairs only for component errors' {
+            $failure = { param($kb, $code) [pscustomobject]@{ Date = '2026-11-04T03:00:00Z'; Title = "2026-11 Cumulative Update ($kb)"; ResultCode = 4; HResult = $code } }
+            $data.Updates.History = @((& $failure 'KB5067777' '0x800f0922'), (& $failure 'KB5067777' '0x800f0922'))
+            $result = Get-Result (& $evaluate) 'UPD-FAILED'
+            $result.Status | Should -Be 'Warning'
+            $result.Actual | Should -Be 'KB5067777 0x800f0922, 1 failing in 30 days'
+            $result.Action | Should -BeNullOrEmpty -Because '0x800f0922 is not a broken-component error'
+
+            $data.Updates.History = @((& $failure 'KB5067777' '0x80073712'))
+            (Get-Result (& $evaluate) 'UPD-FAILED').Action | Should -Be 'UpdateFix'
+        }
+
+        It 'ignores Defender definitions, KB5034441 and aborted installs' {
+            $data.Updates.History = @(
+                [pscustomobject]@{ Date = '2026-11-04T03:00:00Z'; Title = 'Security Intelligence Update for Microsoft Defender Antivirus - KB2267602'; ResultCode = 4; HResult = '0x80070002' }
+                [pscustomobject]@{ Date = '2026-11-04T03:00:00Z'; Title = 'Windows Recovery Environment update (KB5034441)'; ResultCode = 4; HResult = '0x80070643' }
+                [pscustomobject]@{ Date = '2026-11-04T03:00:00Z'; Title = 'Cumulative Update (KB5067777)'; ResultCode = 5; HResult = '0x80240022' }
+            )
+            (Get-Result (& $evaluate) 'UPD-FAILED').Status | Should -Be 'Pass'
+        }
+
+        It 'says when the history was cleared by a reset' {
+            $data.Updates.History = @()
+            $data.Updates.LastReset = '2026-11-04T14:32:00Z'
+            (Get-Result (& $evaluate) 'UPD-FAILED').Actual | Should -Be 'none since the reset 24 h ago'
+        }
+
+        It 'does not judge the agent dates when ConfigMgr, WSUS or a policy drives updates' -TestCases @(
+            @{ Change = { param($d) $d.ConfigMgr = [pscustomobject]@{ ClientInstalled = $true; Workloads = 3; WorkloadsReadable = $true } }; Via = 'ConfigMgr' }
+            @{ Change = { param($d) $d.Updates.Policy.WsusServer = 'http://wsus:8530' }; Via = 'WSUS' }
+            @{ Change = { param($d) $d.Updates.Policy.NoAutoUpdate = $true }; Via = 'policy' }
+        ) {
+            $data.Updates.Agent.LastSearchSuccess = '2026-10-01T00:00:00Z'
+            & $Change $data
+            $result = Get-Result (& $evaluate) 'UPD-SCAN'
+            $result.Status | Should -Be 'Info'
+            $result.Actual | Should -Match "updates via $Via"
+            $result.Action | Should -BeNullOrEmpty
+        }
+
+        It 'judges the agent dates when ConfigMgr left the update workload to Intune' {
+            $data.ConfigMgr = [pscustomobject]@{ ClientInstalled = $true; Workloads = 19; WorkloadsReadable = $true }
+            $data.Updates.Agent.LastSearchSuccess = '2026-10-01T00:00:00Z'
+            (Get-Result (& $evaluate) 'UPD-SCAN').Status | Should -Be 'Fail'
+        }
+
+        It 'only warns about an old scan on a device that just started' {
+            $data.Updates.Agent.LastSearchSuccess = '2026-10-01T00:00:00Z'
+            $data.Device.LastBootTime = '2026-11-05T13:00:00Z'
+            $result = Get-Result (& $evaluate) 'UPD-SCAN'
+            $result.Status | Should -Be 'Warning'
+            $result.Action | Should -BeNullOrEmpty
+        }
+
+        It 'never repairs only because no update was installed for a while' {
+            $data.Updates.Agent.LastInstallSuccess = '2026-08-01T00:00:00Z'
+            $result = Get-Result (& $evaluate) 'UPD-INSTALL'
+            $result.Status | Should -Be 'Warning'
+            $result.Action | Should -BeNullOrEmpty
+        }
+
+        It 'reports an update agent that cannot be asked as Unknown' {
+            $data.Updates.Agent = [pscustomobject]@{ Readable = $false; Error = 'The service cannot be started (0x80070422)'; LastSearchSuccess = $null; LastInstallSuccess = $null; InstallerBusy = $null }
+            $data.Updates.Services[0].StartType = 'Disabled'
+            $evaluation = & $evaluate
+            (Get-Result $evaluation 'UPD-SCAN').Status | Should -Be 'Unknown'
+            $evaluation.RecommendedActions | Should -Be @('UpdateFix') -Because 'the disabled service still asks for the repair'
+        }
+
+        It 'ignores a missing UsoSvc on builds without it' {
+            $data.Updates.Services[3].Present = $false
+            (Get-Result (& $evaluate) 'UPD-SVC').Status | Should -Be 'Pass'
+        }
+
+        It 'fails on an unreachable WSUS server without a repair' {
+            $data.Updates.Policy.WsusServer = 'http://wsus.contoso.local:8530'
+            $data.Updates.Wsus = [pscustomobject]@{ HostName = 'wsus.contoso.local'; Port = 8530; Reachable = $false; Error = 'timed out' }
+            $result = Get-Result (& $evaluate) 'UPD-SOURCE'
+            $result.Status | Should -Be 'Fail'
+            $result.Actual | Should -Be 'WSUS wsus.contoso.local unreachable'
+            $result.Action | Should -BeNullOrEmpty
+        }
+
+        It 'only warns about an unreachable WSUS when quality updates come from Windows Update' {
+            $data.Updates.Policy.WsusServer = 'http://wsus.contoso.local:8530'
+            $data.Updates.Policy.QualityFromWindowsUpdate = $true
+            $data.Updates.Wsus = [pscustomobject]@{ HostName = 'wsus.contoso.local'; Port = 8530; Reachable = $false; Error = 'timed out' }
+            (Get-Result (& $evaluate) 'UPD-SOURCE').Status | Should -Be 'Warning'
+        }
+
+        It 'blocks a reset that cannot help or that just happened' {
+            $data.Updates.Services[0].StartType = 'Disabled'
+            $data.Updates.Policy.WsusServer = 'http://wsus.contoso.local:8530'
+            $data.Updates.Wsus = [pscustomobject]@{ HostName = 'wsus.contoso.local'; Port = 8530; Reachable = $false; Error = 'timed out' }
+            $data.Updates.LastReset = '2026-11-05T10:32:00Z'
+            $evaluation = & $evaluate
+            $evaluation.UpdateBlockers | Should -Contain 'Update source: WSUS wsus.contoso.local unreachable'
+            $evaluation.UpdateBlockers | Should -Contain 'Windows Update: reset 4 h ago, give it time to recover'
+        }
+
+        It 'warns about policies that switch updates off' {
+            $data.Updates.Policy.DisableAccess = $true
+            (Get-Result (& $evaluate) 'UPD-SOURCE').Status | Should -Be 'Warning'
+        }
+
+        It 'warns and fails on low disk space' {
+            $data.Updates.Disk.FreeGB = 8
+            (Get-Result (& $evaluate) 'UPD-DISK').Status | Should -Be 'Warning'
+            $data.Updates.Disk.FreeGB = 3
+            (Get-Result (& $evaluate) 'UPD-DISK').Status | Should -Be 'Fail'
+        }
+
+        It 'reports unreadable parts as Unknown and recommends nothing' {
+            $data.Updates.Agent = $null
+            $data.Updates.History = $null
+            $evaluation = & $evaluate
+            (Get-Result $evaluation 'UPD-SCAN').Status | Should -Be 'Unknown'
+            (Get-Result $evaluation 'UPD-FAILED').Status | Should -Be 'Unknown'
+            @($evaluation.RecommendedActions).Count | Should -Be 0
+        }
+
+        It 'blocks the update repair during a pending reboot or a running installation' {
+            $data.Updates.Agent.LastSearchSuccess = '2026-10-01T00:00:00Z'
+            $data.PendingReboot = [pscustomobject]@{ Pending = $true; Reasons = @('Windows Update') }
+            $data.Updates.Agent.InstallerBusy = $true
+            $evaluation = & $evaluate
+            $evaluation.UpdateBlockers | Should -Be @('Pending reboot: restart the device first', 'Windows Update: installing right now')
+        }
+
+        It 'checks nothing about updates when it is turned off' {
+            $config.CheckWindowsUpdate = $false
+            @((& $evaluate).Results | Where-Object { $_.Category -eq 'Updates' }).Count | Should -Be 0
         }
     }
 

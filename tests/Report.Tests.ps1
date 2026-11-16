@@ -120,6 +120,16 @@ Describe 'Recommended actions in the badge' {
     }
 }
 
+Describe 'Windows Update in the report' {
+    It 'shows the update group and names the repair' {
+        $change = { param($d) $d.Updates.Agent.LastSearchSuccess = '2026-10-01T00:00:00Z'; $d.Device.LastBootTime = '2026-11-01T00:00:00Z' }
+        $text = Get-PlainText (Format-ICTReport -Report (New-TestReport -Change $change) -Now $TestNow -NoColor)
+        $text | Should -Match ((([string][char]0x2500) * 2) + ' Updates')
+        $text | Should -Match 'Recommended: UPDATES'
+        $text | Should -Match 'Repairable here \(Windows Update\)'
+    }
+}
+
 Describe 'Format-ICTProgressItem' {
     It 'marks failed sections' {
         Format-ICTProgressItem -Name 'Security' -Succeeded $false -NoColor -Ascii | Should -Be '[WARN] Security'

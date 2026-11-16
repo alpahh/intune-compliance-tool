@@ -258,3 +258,62 @@ Describe 'Running as SYSTEM' -Tag 'Windows' -Skip:(-not $runSystem) {
         }
     }
 }
+
+Describe 'Windows Update on a real machine' -Tag 'Windows' -Skip:(-not $runHere) {
+    It 'reads the update agent, history, policy and disk without throwing' {
+        InModuleScope IntuneComplianceTool {
+            # The CI runner image disables wuauserv: then the agent is simply not readable.
+            $agent = Get-ICTWindowsUpdateState
+            $agent.Readable | Should -BeOfType [bool]
+            if ((Get-Service -Name wuauserv).StartType -ne 'Disabled') { { $null = @(Get-ICTUpdateHistory -Days 30) } | Should -Not -Throw }
+            (Get-ICTUpdatePolicy).PSObject.Properties.Name | Should -Contain 'WsusServer'
+            (Get-ICTSystemDisk).SizeGB | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Windows Update reset as SYSTEM' -Tag 'Windows' -Skip:(-not $runSystem) {
+    It 're-enables the services, sets SoftwareDistribution aside, keeps the first copy and starts the services again' {
+        $folder = Join-Path $env:ProgramData ('ICT-CI-' + [guid]::NewGuid().ToString('N'))
+        $stamp = [datetime]::Now.ToString('yyyyMMdd-HHmmss')
+        $oldest = Join-Path $env:windir 'SoftwareDistribution.ict-20000101-000000'
+        $middle = Join-Path $env:windir 'SoftwareDistribution.ict-20000102-000000'
+        try {
+            # Two earlier copies: the first (original data) must stay, the one in between must go.
+            $null = New-Item -Path $oldest -ItemType Directory -Force
+            Start-Sleep -Seconds 1
+            $null = New-Item -Path $middle -ItemType Directory -Force
+            # The CI runner image disables wuauserv: the repair must turn it back on.
+            & sc.exe config wuauserv start= disabled | Out-Null
+
+            InModuleScope IntuneComplianceTool -Parameters @{ Folder = $folder; Stamp = $stamp } {
+                Protect-ICTDirectory -Path $Folder
+                $state = Join-Path $Folder 'state.jsonl'
+                $script = Join-Path $Folder 'update-repair.ps1'
+                Set-Content -LiteralPath $script -Value (New-ICTUpdateRepairScript -StatePath $state -Stamp $Stamp) -Encoding UTF8
+                $task = Start-ICTSystemScript -ScriptPath $script
+                try {
+                    $wait = Wait-ICTSystemScript -TaskName $task -StatePath $state -TimeoutSeconds 300 -PollIntervalSeconds 2
+                    $wait.Final | Should -Not -BeNullOrEmpty
+                    $wait.Final.Status | Should -Be 'Succeeded' -Because $wait.Final.Detail
+                    @($wait.Lines | ForEach-Object { $_.Stage }) | Should -Be @('start', 'services', 'stop', 'reset', 'start-services', 'scan', 'end')
+                    ($wait.Lines | Where-Object { $_.Stage -eq 'services' }).Detail | Should -Match 'wuauserv'
+                    ($wait.Lines | Where-Object { $_.Stage -eq 'reset' }).Detail | Should -Match 'SoftwareDistribution set aside'
+                }
+                finally { Remove-ICTSystemTask -TaskName $task }
+            }
+            Test-Path -LiteralPath (Join-Path $env:windir "SoftwareDistribution.ict-$stamp") | Should -BeTrue
+            Test-Path -LiteralPath $oldest | Should -BeTrue -Because 'the first copy holds the original data'
+            Test-Path -LiteralPath $middle | Should -BeFalse
+            "$((Get-Service -Name wuauserv).StartType)" | Should -Not -Be 'Disabled'
+            (Get-Service -Name CryptSvc).Status | Should -Be 'Running'
+            (Get-Service -Name BITS).StartType | Should -Not -Be 'Disabled'
+        }
+        finally {
+            foreach ($path in $oldest, $middle, (Join-Path $env:windir "SoftwareDistribution.ict-$stamp"), (Join-Path $env:windir "System32\catroot2.ict-$stamp")) {
+                if (Test-Path -LiteralPath $path) { cmd /c rmdir /s /q "$path" }
+            }
+            if (Test-Path -LiteralPath $folder) { cmd /c rmdir /s /q "$folder" }
+        }
+    }
+}

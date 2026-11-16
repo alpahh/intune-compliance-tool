@@ -385,3 +385,150 @@ Describe 'Invoke-ICTRemediation' {
         Should -Invoke -ModuleName IntuneComplianceTool -CommandName Invoke-ICTReEnrollment -ParameterFilter { $Method -eq 'DeviceCredential' }
     }
 }
+
+Describe 'Invoke-ICTUpdateRepair' {
+    BeforeEach {
+        $m = 'IntuneComplianceTool'
+        $script:work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $script:scanned = $false
+        $script:stateLines = @(
+            '{"Stage":"start","Status":"Running","Detail":""}'
+            '{"Stage":"services","Status":"Done","Detail":"re-enabled wuauserv"}'
+            '{"Stage":"stop","Status":"Done","Detail":"update services stopped"}'
+            '{"Stage":"reset","Status":"Done","Detail":"set aside: SoftwareDistribution, catroot2"}'
+            '{"Stage":"start-services","Status":"Done","Detail":"update services started"}'
+            '{"Stage":"scan","Status":"Done","Detail":"scan started"}'
+            '{"Stage":"end","Status":"Succeeded","Detail":""}'
+        )
+        Mock -ModuleName $m Test-ICTIsWindows { $true }
+        Mock -ModuleName $m Test-ICTIsElevated { $true }
+        Mock -ModuleName $m Test-ICTRepairRunning { $false }
+        Mock -ModuleName $m Get-ICTWindowsUpdateState {
+            $last = $(if ($script:scanned) { [datetime]::UtcNow.AddSeconds(5).ToString('o') } else { '2026-10-01T00:00:00Z' })
+            [pscustomobject]@{ LastSearchSuccess = $last; LastInstallSuccess = $null; InstallerBusy = $false }
+        }
+        Mock -ModuleName $m Protect-ICTDirectory { $null = New-Item -Path $Path -ItemType Directory -Force }
+        Mock -ModuleName $m New-ICTPrivateDirectory { $p = Join-Path $Parent ($Prefix + '-test'); $null = New-Item -Path $p -ItemType Directory -Force; $p }
+        Mock -ModuleName $m Remove-ICTSystemTask { }
+        Mock -ModuleName $m Start-ICTSystemScript { 'IntuneComplianceTool-Repair-5678' }
+        Mock -ModuleName $m Get-ICTSystemScriptState { $script:stateLines | ForEach-Object { $_ | ConvertFrom-Json } }
+        Mock -ModuleName $m Get-ICTSystemTaskState { [pscustomobject]@{ State = 'Running'; LastTaskResult = 267009 } }
+        Mock -ModuleName $m Set-ICTCtrlCAsInput { $false }
+        Mock -ModuleName $m Start-Sleep { $script:scanned = $true }
+    }
+
+    It 'shows the plan with -WhatIf and changes nothing' {
+        $result = Invoke-ICTUpdateRepair -WorkDirectory $work -Deep -WhatIf
+        $result.Status | Should -Be 'WhatIf'
+        $result.Steps[0].Detail | Should -Match 'DISM'
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Start-ICTSystemScript -Times 0 -Exactly
+    }
+
+    It 'resets the components as SYSTEM and waits for a successful scan' {
+        $result = Invoke-ICTUpdateRepair -WorkDirectory $work -Confirm:$false
+        $result.Status | Should -Be 'Succeeded'
+        $result.Steps.Name | Should -Contain 'Reset components'
+        ($result.Steps | Where-Object { $_.Name -eq 'Update scan' }).Status | Should -Be 'Pass'
+        $script = Get-Content -LiteralPath (Join-Path $result.Folder 'update-repair.ps1') -Raw
+        $script | Should -Match ([regex]::Escape('$deep = $false'))
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Start-ICTSystemScript -Times 1 -Exactly -ParameterFilter { $TimeLimitMinutes -ge 25 }
+    }
+
+    It 'gives the deep repair a longer task time limit' {
+        $null = Invoke-ICTUpdateRepair -WorkDirectory $work -Deep -ScriptTimeoutSeconds 5400 -Confirm:$false
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Start-ICTSystemScript -Times 1 -Exactly -ParameterFilter { $TimeLimitMinutes -ge 100 }
+    }
+
+    It 'still succeeds, with a warning, when the scan takes longer' {
+        Mock -ModuleName IntuneComplianceTool Start-Sleep { }
+        $result = Invoke-ICTUpdateRepair -WorkDirectory $work -ScanTimeoutSeconds 10 -PollIntervalSeconds 5 -Confirm:$false
+        $result.Status | Should -Be 'Succeeded'
+        ($result.Steps | Where-Object { $_.Name -eq 'Update scan' }).Status | Should -Be 'Warning'
+        $result.Message | Should -Match 'not finished yet'
+    }
+
+    It 'reports a stage that failed' {
+        $script:stateLines = @('{"Stage":"stop","Status":"Done","Detail":"x"}', '{"Stage":"end","Status":"Failed","Detail":"reset: access denied"}')
+        $result = Invoke-ICTUpdateRepair -WorkDirectory $work -Confirm:$false
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Match 'reset: access denied'
+    }
+
+    It 'fails at once when the SYSTEM task stopped without finishing' {
+        $script:stateLines = @()
+        Mock -ModuleName IntuneComplianceTool Get-ICTSystemTaskState { [pscustomobject]@{ State = 'Ready'; LastTaskResult = 1 } }
+        $result = Invoke-ICTUpdateRepair -WorkDirectory $work -Confirm:$false
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Match 'stopped without finishing'
+    }
+
+    It 'refuses to start while Windows Update installs or another repair runs' -TestCases @(
+        @{ Busy = $true; Running = $false; Expected = 'installing right now' }
+        @{ Busy = $false; Running = $true; Expected = 'still running' }
+    ) {
+        Mock -ModuleName IntuneComplianceTool Get-ICTWindowsUpdateState { [pscustomobject]@{ LastSearchSuccess = $null; InstallerBusy = $Busy } }
+        Mock -ModuleName IntuneComplianceTool Test-ICTRepairRunning { $Running }
+        $result = Invoke-ICTUpdateRepair -WorkDirectory $work -Confirm:$false
+        $result.Status | Should -Be 'Blocked'
+        $result.Message | Should -Match $Expected
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Start-ICTSystemScript -Times 0 -Exactly
+    }
+}
+
+Describe 'Invoke-ICTRemediation with Windows Update' {
+    BeforeEach {
+        Mock -ModuleName IntuneComplianceTool Invoke-ICTUpdateRepair { [pscustomobject]@{ Status = 'Succeeded'; Succeeded = $true; Message = $null; Steps = @([pscustomobject]@{ Name = 'Reset components'; Status = 'Pass'; Detail = '' }) } }
+    }
+
+    It 'runs the update repair, deep and with the long timeout when asked' {
+        $evaluation = [pscustomobject]@{ RecommendedActions = @('UpdateFix'); UpdateBlockers = @(); ReEnrollBlockers = @(); SyncBlockers = @(); Results = @() }
+        $result = Invoke-ICTRemediation -Evaluation $evaluation -RepairComponentStore -Confirm:$false
+        $result.Status | Should -Be 'Succeeded'
+        $result.ChangesMade | Should -BeTrue
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Invoke-ICTUpdateRepair -Times 1 -Exactly -ParameterFilter { $Deep -and $ScriptTimeoutSeconds -eq 5400 }
+    }
+
+    It 'does not reset Windows Update while a reboot is pending, unless forced' {
+        $evaluation = [pscustomobject]@{ RecommendedActions = @('UpdateFix'); UpdateBlockers = @('Pending reboot: restart the device first'); ReEnrollBlockers = @(); SyncBlockers = @(); Results = @() }
+        $result = Invoke-ICTRemediation -Evaluation $evaluation -Confirm:$false
+        $result.Status | Should -Be 'Blocked'
+        $result.UpdateBlockers | Should -Be @('Pending reboot: restart the device first')
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Invoke-ICTUpdateRepair -Times 0 -Exactly
+
+        (Invoke-ICTRemediation -Evaluation $evaluation -Force -Confirm:$false).Status | Should -Be 'Succeeded'
+    }
+}
+
+Describe 'Invoke-ICTUpdateRepair edge cases' {
+    BeforeEach {
+        $m = 'IntuneComplianceTool'
+        $script:work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        Mock -ModuleName $m Test-ICTIsWindows { $true }
+        Mock -ModuleName $m Test-ICTIsElevated { $true }
+        Mock -ModuleName $m Test-ICTRepairRunning { $false }
+        Mock -ModuleName $m Get-ICTUpdatePolicy { [pscustomobject]@{ WsusServer = 'http://wsus:8530'; QualityFromWindowsUpdate = $false; DisableAccess = $false; RepairFromWindowsUpdate = $false } }
+        Mock -ModuleName $m Protect-ICTDirectory { $null = New-Item -Path $Path -ItemType Directory -Force }
+        Mock -ModuleName $m New-ICTPrivateDirectory { $p = Join-Path $Parent ($Prefix + '-test'); $null = New-Item -Path $p -ItemType Directory -Force; $p }
+        Mock -ModuleName $m Remove-ICTSystemTask { }
+        Mock -ModuleName $m Start-ICTSystemScript { 'IntuneComplianceTool-Repair-9' }
+        Mock -ModuleName $m Get-ICTSystemScriptState { }
+        Mock -ModuleName $m Get-ICTSystemTaskState { [pscustomobject]@{ State = 'Ready'; LastTaskResult = 1 } }
+        Mock -ModuleName $m Set-ICTCtrlCAsInput { $false }
+        Mock -ModuleName $m Start-ICTService { }
+        Mock -ModuleName $m Start-Sleep { }
+    }
+
+    It 'still starts when the update agent cannot be asked (wuauserv disabled)' {
+        Mock -ModuleName IntuneComplianceTool Get-ICTWindowsUpdateState { [pscustomobject]@{ Readable = $false; Error = '0x80070422'; LastSearchSuccess = $null; InstallerBusy = $null } }
+        $null = Invoke-ICTUpdateRepair -WorkDirectory $work -Confirm:$false
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Start-ICTSystemScript -Times 1 -Exactly
+    }
+
+    It 'skips DISM when WSUS is the repair source, and starts the services again after a killed task' {
+        Mock -ModuleName IntuneComplianceTool Get-ICTWindowsUpdateState { [pscustomobject]@{ Readable = $true; LastSearchSuccess = $null; InstallerBusy = $false } }
+        $result = Invoke-ICTUpdateRepair -WorkDirectory $work -Deep -Confirm:$false
+        $result.Status | Should -Be 'Failed'
+        (Get-Content -LiteralPath (Join-Path $result.Folder 'update-repair.ps1') -Raw) | Should -Match ([regex]::Escape('$repairSource = $false'))
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Start-ICTService -ParameterFilter { $Name -eq 'wuauserv' }
+    }
+}

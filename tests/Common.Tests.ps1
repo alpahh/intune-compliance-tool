@@ -216,6 +216,21 @@ Describe 'Re-enrollment helpers' {
         }
     }
 
+    It 'generates an update repair script that parses, is ASCII and includes DISM only when asked' {
+        InModuleScope IntuneComplianceTool {
+            foreach ($deep in $false, $true) {
+                $text = New-ICTUpdateRepairScript -StatePath "C:\Program Data\it's\s.jsonl" -Stamp '20261116-101500' -Deep:$deep
+                $errors = $null
+                $null = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errors)
+                $errors | Should -BeNullOrEmpty
+                $text | Should -Match '^[\x09\x0A\x0D\x20-\x7E]*$'
+                $text | Should -Match ([regex]::Escape("`$statePath = 'C:\Program Data\it''s\s.jsonl'"))
+                $text | Should -Match ([regex]::Escape("`$deep = `$$deep"))
+                $text | Should -Not -Match '__[A-Z]+__'
+            }
+        }
+    }
+
     It 'generates an empty list when there is nothing to remove' {
         InModuleScope IntuneComplianceTool {
             $text = New-ICTRepairScript -EnrollerArgument '/c /AutoEnrollMDM' -StatePath 'C:\s.jsonl'

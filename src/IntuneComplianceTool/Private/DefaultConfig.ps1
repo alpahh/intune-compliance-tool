@@ -20,6 +20,17 @@ $script:ICTDefaultConfigJson = @'
   "MaxUptimeDays": 30,
   "ImeLogLookbackDays": 7,
 
+  "CheckWindowsUpdate": true,
+  "MaxUpdateScanAgeDays": 7,
+  "MaxUpdateInstallAgeDays": 45,
+  "UpdateHistoryDays": 30,
+  "MinFreeDiskGB": 10,
+  "UpdateRepairTimeoutSeconds": 900,
+  "UpdateDeepRepairTimeoutSeconds": 5400,
+  "UpdateScanTimeoutSeconds": 300,
+  "UpdateRepairErrorCodes": ["0x80070002", "0x80070003", "0x80073712", "0x800f081f", "0x800f0831", "0x80070490", "0x80248007"],
+  "UpdateResetCooldownHours": 24,
+
   "Endpoints": [
     "login.microsoftonline.com",
     "enterpriseregistration.windows.net",

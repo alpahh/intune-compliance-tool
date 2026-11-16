@@ -21,6 +21,7 @@
         'Invoke-ICTReEnrollment'
         'Invoke-ICTLapsRetry'
         'Invoke-ICTRemediation'
+        'Invoke-ICTUpdateRepair'
         'Initialize-ICTLogging'
     )
     CmdletsToExport      = @()

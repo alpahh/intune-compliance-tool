@@ -1,6 +1,6 @@
 # Intune Compliance Tool
 
-Checks a Windows client's Intune MDM enrollment, compliance settings and Windows LAPS state, shows the result in the terminal, and can repair a broken enrollment. It is built to be run over SSH as the local admin account (`masteruser`).
+Checks a Windows client's Intune MDM enrollment, compliance settings, Windows Update and Windows LAPS state, shows the result in the terminal, and can repair a broken enrollment or a broken Windows Update. It is built to be run over SSH as the local admin account (`masteruser`).
 
 ```text
 ╭────────────────────────────────────────────────────────────────────────────╮
@@ -35,6 +35,7 @@ Checks a Windows client's Intune MDM enrollment, compliance settings and Windows
 ./ict.sh PC-0421 -Detailed                # with the reason and fix for every finding
 ./ict.sh PC-0421 -Remediate -WhatIf       # show what a repair would do
 ./ict.sh PC-0421 -Remediate               # repair
+./ict.sh PC-0421 -Remediate -RepairComponentStore   # also DISM and SFC if Windows Update needs a repair
 ./ict.sh PC-0421 -CollectDiagnostics      # also copy the MDM diagnostics ZIP to ./diagnostics
 ./ict.sh PC-0421,PC-0422,PC-0423          # several devices: one summary table
 ./ict.sh -f hosts.txt                     # hosts from a file
@@ -48,7 +49,7 @@ Checks a Windows client's Intune MDM enrollment, compliance settings and Windows
 ## Options
 
 ```powershell
-.\IntuneComplianceTool.ps1 [-Remediate [-WhatIf] [-Force] [-EnrollmentMethod UserCredential|DeviceCredential]]
+.\IntuneComplianceTool.ps1 [-Remediate [-WhatIf] [-Force] [-RepairComponentStore] [-EnrollmentMethod UserCredential|DeviceCredential]]
                            [-Detailed | -Json | -Summary] [-SaveReport] [-CollectDiagnostics]
                            [-OutputDirectory <path>] [-ConfigPath <file.json>] [-NoColor] [-Ascii]
 ```
@@ -58,6 +59,7 @@ Checks a Windows client's Intune MDM enrollment, compliance settings and Windows
 | `-Remediate` | Repair what can be repaired. There is no prompt: the switch is the consent. |
 | `-WhatIf` | With `-Remediate`: only show the plan, change nothing. |
 | `-Force` | Start the enrollment repair even when blockers were found. The re-enrollment's own safety checks (Entra join, a usable signed-in user) still apply. |
+| `-RepairComponentStore` | With `-Remediate`: when Windows Update needs a repair, also run DISM `/RestoreHealth` and `sfc /scannow`. This can take an hour; it runs as SYSTEM, so the SSH session may end. |
 | `-EnrollmentMethod` | `UserCredential` (default; needs an Entra or domain user signed in at the console) or `DeviceCredential`. |
 | `-Detailed` | Reason and fix for every finding, plus the latest MDM error events. |
 | `-Json` / `-Summary` | Print only the full report as JSON, or one tab-separated summary line. |
@@ -88,6 +90,7 @@ With several hosts, `ict.sh` returns the highest code.
 | Health | `dmwappushservice`, Intune Management Extension and its log errors, ConfigMgr / co-management workloads, MDM error events, pending reboot and uptime |
 | Network | WinHTTP proxy, TCP 443 to the Intune and Entra endpoints (all at once), clock skew against Microsoft's servers |
 | Security | OS build and, optionally, patch level (UBR), BitLocker, TPM, Secure Boot, Defender real-time protection and signature age, firewall (effective policy) |
+| Updates | Update services, last successful scan and install, failed updates (by KB, Defender definitions ignored), update source (Windows Update, Intune, WSUS reachability, blocking policies), free disk space |
 | LAPS | Policy (Intune, Group Policy, local or legacy) and backup target, managed account (also with automatic account management), last rotation, backup errors, post-sign-in actions |
 
 The result is one of: **Compliant**, **Not compliant** (a setting is wrong; re-enrolling would not help), **Enrollment broken** (the device does not reach Intune properly) or **Indeterminate** (nothing failed, but some data could not be read). Data that cannot be read is always reported as unknown, never as missing, so it never triggers a repair.
@@ -108,6 +111,15 @@ The person signed in at the device is shown separately from the SSH account. Use
      3. Run the removal and `deviceenroller.exe` **as SYSTEM** in a temporary scheduled task. A dropped SSH session or Ctrl+C cannot stop it half-way.
      4. Wait until a complete new enrollment exists (a new enrollment key and a new MDM certificate), then check the device again.
 4. **LAPS:** if the backup failed or the rotation is overdue, run `Invoke-LapsPolicyProcessing` and read the real outcome from the LAPS event log.
+5. **Windows Update:** if update services are disabled, the last successful scan is too old, or updates fail with errors that point to broken update components, reset Windows Update as SYSTEM:
+   1. Re-enable disabled update services.
+   2. Stop the services (with a time limit).
+   3. Set `SoftwareDistribution` and `catroot2` aside. They are renamed to `*.ict-<time>`, not deleted. The first copy and the newest one are kept.
+   4. Start the services again, including stopped dependents such as AppLocker's.
+   5. With `-RepairComponentStore`, run DISM `/RestoreHealth` and `sfc /scannow`. DISM is skipped if the device can't use Windows Update as its repair source.
+   6. Start a scan and wait for it to succeed.
+
+   This clears the update history shown in Settings. The reset doesn't run while a reboot is pending, while Windows Update is installing, within 24 hours of the last reset, or while the update source is unreachable or blocked by policy. On devices whose updates come from ConfigMgr, WSUS or a policy, the scan and install dates are only shown, not judged.
 
 The enrollment repair does not start when a blocker is found: for example the device isn't Entra-joined, an endpoint can't be reached, ConfigMgr controls the enrollment on a co-managed device, auto-enrollment failed for a reason a new attempt would hit again (no license, user not in MDM scope), or the session isn't elevated. A plain sync is only blocked by problems that would stop it too. `-Force` overrides the blockers, but not the re-enrollment's own safety checks. Problems like BitLocker, firewall or Defender are reported but never "fixed" by re-enrolling.
 
@@ -124,7 +136,9 @@ Defaults live in [`src/IntuneComplianceTool/Private/DefaultConfig.ps1`](src/Intu
   "MaxDaysSinceLastSync": 3,
   "LapsExpectedAccount": "masteruser",
   "EnrollmentMethod": "DeviceCredential",
-  "EscalateSyncToReEnroll": false
+  "EscalateSyncToReEnroll": false,
+  "MaxUpdateScanAgeDays": 10,
+  "MinFreeDiskGB": 20
 }
 ```
 
@@ -167,4 +181,5 @@ These details come from documentation and community practice. They haven't been 
 - `LastPasswordUpdateTime` in `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\State`, and the LAPS event IDs (10004/10029 success, 10005 failure).
 - The auto-enrollment events 75/76 and the HRESULT in their message.
 - `MdmDiagnosticsTool.exe -area ... -zip ...` with the areas used here.
+- The Windows Update reset on a real Windows 10/11 client (CI runs it on Windows Server), `UsoClient StartScan` as SYSTEM, and DISM/SFC in the SYSTEM task.
 - `ComgmtWorkloads` on `root\ccm\InvAgt:CCM_System` and its workload bits, on a co-managed client and on one that isn't. Microsoft does not document this value.

@@ -16,18 +16,18 @@ function Get-ICTDeviceData {
     param(
         [psobject]$Config,
         [scriptblock]$OnProgress,
-        [ValidateSet('Device', 'Join', 'Enrollment', 'Services', 'Security', 'LAPS', 'Network', 'Event log')][string[]]$Section,
+        [ValidateSet('Device', 'Join', 'Enrollment', 'Services', 'Security', 'Updates', 'LAPS', 'Network', 'Event log')][string[]]$Section,
         [psobject]$Previous
     )
 
     if (-not (Test-ICTIsWindows)) { throw 'Get-ICTDeviceData reads the local Windows device and must run on Windows.' }
     if (-not $Config) { $Config = Get-ICTConfig }
-    $allSections = @('Device', 'Join', 'Enrollment', 'Services', 'Security', 'LAPS', 'Network', 'Event log')
+    $allSections = @('Device', 'Join', 'Enrollment', 'Services', 'Security', 'Updates', 'LAPS', 'Network', 'Event log')
     if (-not $Section) { $Section = $allSections }
     $sectionProperties = @{
         'Device' = @('RunAs', 'ConsoleUser', 'Device', 'PendingReboot'); 'Join' = @('Join')
         'Enrollment' = @('AutoEnroll', 'Enrollments', 'MdmCertificates', 'Sync'); 'Services' = @('Services', 'ConfigMgr', 'ImeLog')
-        'Security' = @('Security'); 'LAPS' = @('Laps'); 'Network' = @('Network'); 'Event log' = @('MdmEvents')
+        'Security' = @('Security'); 'Updates' = @('Updates'); 'LAPS' = @('Laps'); 'Network' = @('Network'); 'Event log' = @('MdmEvents')
     }
 
     $data = [ordered]@{
@@ -101,6 +101,25 @@ function Get-ICTDeviceData {
                     SecureBoot = & $collect 'SecureBoot' { Get-ICTSecureBootState }
                     Defender   = & $collect 'Defender' { Get-ICTDefenderState }
                     Firewall   = & $collect 'Firewall' { , @(Get-ICTFirewallState) }
+                }
+            }
+            'Updates' {
+                if (-not $Config.CheckWindowsUpdate) { break }
+                $policy = & $collect 'UpdatePolicy' { Get-ICTUpdatePolicy }
+                $wsus = $null
+                $wsusHost = Get-ICTUriHost $policy.WsusServer
+                if ($wsusHost) {
+                    $port = ([uri]$policy.WsusServer).Port
+                    $wsus = & $collect 'WsusServer' { Test-ICTTcpEndpoint -HostName $wsusHost -Port $port -TimeoutMs $Config.EndpointTimeoutMs }
+                }
+                $data.Updates = [pscustomobject]@{
+                    Agent    = & $collect 'UpdateAgent' { Get-ICTWindowsUpdateState }
+                    History  = & $collect 'UpdateHistory' { , @(Get-ICTUpdateHistory -Days $Config.UpdateHistoryDays) }
+                    Services = & $collect 'UpdateServices' { , @(Get-ICTServiceState -Name 'wuauserv', 'BITS', 'CryptSvc', 'UsoSvc') }
+                    LastReset = & $collect 'UpdateReset' { Get-ICTUpdateResetTime }
+                    Policy   = $policy
+                    Wsus     = $wsus
+                    Disk     = & $collect 'SystemDisk' { Get-ICTSystemDisk }
                 }
             }
             'LAPS' {
