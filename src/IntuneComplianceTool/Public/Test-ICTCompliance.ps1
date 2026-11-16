@@ -47,6 +47,12 @@ function Test-ICTCompliance {
             $reEnrollBlockers += 'Session: not running as administrator'
         }
 
+        # Also without a ReEnroll recommendation: a sync that fails can escalate to a re-enrollment.
+        if ($DeviceData.ConfigMgr.ClientInstalled) {
+            if (-not $DeviceData.ConfigMgr.WorkloadsReadable) { $reEnrollBlockers += 'ConfigMgr: the co-management state could not be read' }
+            elseif (@(Get-ICTIntuneWorkload -Flags ([int]$DeviceData.ConfigMgr.Workloads)).Count -gt 0) { $reEnrollBlockers += 'Co-management: ConfigMgr controls the MDM enrollment of this device' }
+        }
+
         $enrollmentAction = @($actions | Where-Object { $_ -eq 'ReEnroll' -or $_ -eq 'Sync' }) | Select-Object -First 1
         $blockers = $(if ($enrollmentAction -eq 'Sync') { $syncBlockers } else { $reEnrollBlockers })
 

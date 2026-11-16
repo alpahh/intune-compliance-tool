@@ -115,7 +115,8 @@ $collect = {
 
 $exitCode = 10
 try {
-    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { Write-Verbose 'Console encoding could not be changed.' }
+    # UTF-8 without a byte order mark, so -Json output can be piped straight into jq.
+    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { Write-Verbose 'Console encoding could not be changed.' }
 
     if (-not $OutputDirectory) {
         $OutputDirectory = $(if ($env:ProgramData) { Join-Path $env:ProgramData 'IntuneComplianceTool' } else { Join-Path $PSScriptRoot 'output' })

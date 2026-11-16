@@ -21,7 +21,8 @@ function New-ICTRepairScript {
         [AllowEmptyCollection()][string[]]$EnrollmentId = @(),
         [AllowEmptyCollection()][string[]]$Thumbprint = @(),
         [Parameter(Mandatory)][string]$EnrollerArgument,
-        [Parameter(Mandatory)][string]$StatePath
+        [Parameter(Mandatory)][string]$StatePath,
+        [string]$EnrollerPath   # only the integration tests pass this, to run a harmless program instead
     )
 
     $list = { param([string[]]$Items) '@(' + ((@($Items) | Where-Object { $_ } | ForEach-Object { ConvertTo-ICTPsLiteral $_ }) -join ', ') + ')' }
@@ -73,7 +74,7 @@ try {
     Write-State 'certificates' 'Done' ('{0} certificates removed' -f `$removedCertificates)
 
     `$stage = 'enroll'
-    `$enroller = Join-Path `$env:windir 'System32\deviceenroller.exe'
+    `$enroller = $(if ($EnrollerPath) { ConvertTo-ICTPsLiteral $EnrollerPath } else { "Join-Path `$env:windir 'System32\deviceenroller.exe'" })
     `$process = Start-Process -FilePath `$enroller -ArgumentList $(ConvertTo-ICTPsLiteral $EnrollerArgument) -PassThru -WindowStyle Hidden
     if (`$process.WaitForExit(180000)) { Write-State 'enroll' 'Done' ('exit {0}' -f `$process.ExitCode) }
     else { Write-State 'enroll' 'Done' 'still running after 180 s' }

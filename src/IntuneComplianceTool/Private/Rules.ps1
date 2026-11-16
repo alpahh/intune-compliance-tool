@@ -53,6 +53,15 @@ function Format-ICTDate {
     return $value.ToString('yyyy-MM-dd', $script:ICTInvariant)
 }
 
+function Get-ICTIntuneWorkload {
+    <# Names of the co-management workloads moved to Intune. Bit 1 and the higher bits are baseline markers, not workloads. #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([int]$Flags)
+    $names = [ordered]@{ 2 = 'Compliance'; 4 = 'Resource access'; 8 = 'Device config'; 16 = 'Updates'; 32 = 'Endpoint protection'; 64 = 'Client apps'; 128 = 'Office apps' }
+    return [string[]]@(foreach ($bit in $names.Keys) { if ($Flags -band [int]$bit) { $names[[object]$bit] } })
+}
+
 function Get-ICTJoinRule {
     [CmdletBinding()]
     param([psobject]$DeviceData, [datetime]$Now)
@@ -223,6 +232,37 @@ function Get-ICTHealthRule {
         }
         elseif ($service.StartType -eq 'Manual' -and $service.Status -ne 'Running') { New-ICTRuleResult $id $label Pass 'Manual (starts on demand)' }
         else { New-ICTRuleResult $id $label Pass ('{0} ({1})' -f $service.Status, $service.StartType) }
+    }
+
+    $configMgr = $DeviceData.ConfigMgr
+    if ($configMgr -and $configMgr.ClientInstalled) {
+        $flags = [int]$configMgr.Workloads
+        $moved = Get-ICTIntuneWorkload -Flags $flags
+        if (-not $configMgr.WorkloadsReadable) { New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Info 'client installed, workloads unreadable' }
+        elseif ($moved.Count -eq 0) { New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Info 'client installed, no workloads in Intune' }
+        else {
+            $actual = 'co-managed, {0} workloads in Intune' -f $moved.Count
+            $list = 'Workloads in Intune: {0}.' -f ($moved -join ', ')
+            if ($flags -band 2) { New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Info $actual -Message $list }
+            else {
+                New-ICTRuleResult 'HLT-COMGMT' 'ConfigMgr' Warning $actual -Message "$list The compliance workload is with ConfigMgr, so Intune policies do not decide whether this device is compliant." `
+                    -Remediation 'Move the compliance policies workload to Intune, or check the ConfigMgr baselines.'
+            }
+        }
+    }
+
+    $ime = $DeviceData.ImeLog
+    $imeService = @($DeviceData.Services | Where-Object { $_ -and $_.Name -eq 'IntuneManagementExtension' -and $_.Present }) | Select-Object -First 1
+    if ($ime -and $imeService) {
+        # The logs rotate: name the period they really cover.
+        $oldest = ConvertFrom-ICTDate $ime.OldestEntry
+        $span = $(if ($oldest -and ($Now - $oldest).TotalDays -lt $ime.LookbackDays) { 'since ' + (Format-ICTRelativeTime $oldest -Now $Now) } else { 'in {0} days' -f $ime.LookbackDays })
+        if ($ime.ErrorCount -eq 0) { New-ICTRuleResult 'HLT-IME' 'Extension log' Pass "no errors $span" }
+        else {
+            $latest = @($ime.Recent) | Select-Object -First 1
+            New-ICTRuleResult 'HLT-IME' 'Extension log' Info ('{0} errors {1}, latest {2}' -f $ime.ErrorCount, $span, (Format-ICTRelativeTime $latest.TimeCreated -Now $Now)) `
+                -Message 'Errors from Win32 apps, scripts or remediations. Some are normal; run with -Detailed to see the latest.'
+        }
     }
 
     $events = $DeviceData.MdmEvents

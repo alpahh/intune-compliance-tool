@@ -18,6 +18,7 @@ $script:ICTDefaultConfigJson = @'
   "RecommendedServices": ["IntuneManagementExtension"],
   "MdmEventLookbackDays": 7,
   "MaxUptimeDays": 30,
+  "ImeLogLookbackDays": 7,
 
   "Endpoints": [
     "login.microsoftonline.com",

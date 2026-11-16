@@ -107,7 +107,9 @@ function Get-ICTAutoEnrollState {
     param()
     $policy = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\MDM' -ErrorAction SilentlyContinue
     $enrollments = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue
-    $last = @(Get-ICTWinEvent -LogName $script:ICTMdmLogName -XPath '*[System[(EventID=75 or EventID=76)]]' -MaxEvents 1) | Select-Object -First 1
+    $last = $null
+    try { $last = @(Get-ICTWinEvent -LogName $script:ICTMdmLogName -XPath '*[System[(EventID=75 or EventID=76)]]' -MaxEvents 1) | Select-Object -First 1 }
+    catch { Write-ICTLog -Level Warning "Could not read the auto-enrollment events: $($_.Exception.Message)" }
 
     $hresult = $null
     if ($last -and $last.Message -match '0x[0-9A-Fa-f]{8}') { $hresult = $Matches[0].ToLowerInvariant() }
@@ -199,6 +201,38 @@ function Get-ICTServiceState {
             Status    = $(if ($service) { "$($service.Status)" } else { $null })
             StartType = $(if ($service) { "$($service.StartType)" } else { $null })
         }
+    }
+}
+
+function Get-ICTConfigMgrState {
+    <#
+        ConfigMgr client and its co-management workload bits (ComgmtWorkloads on CCM_System).
+        WorkloadsReadable is $false only when the WMI class could not be read at all.
+    #>
+    [CmdletBinding()]
+    param()
+    if ($null -eq (Get-Service -Name CcmExec -ErrorAction SilentlyContinue)) { return [pscustomobject]@{ ClientInstalled = $false; Workloads = $null; WorkloadsReadable = $true } }
+    try {
+        $system = Get-CimInstance -Namespace 'root\ccm\InvAgt' -ClassName CCM_System -ErrorAction Stop
+        if ($null -eq $system) { throw 'CCM_System has no instance.' }
+        return [pscustomobject]@{ ClientInstalled = $true; Workloads = $system.ComgmtWorkloads; WorkloadsReadable = $true }
+    }
+    catch {
+        Write-ICTLog -Level Warning "Could not read the co-management workloads: $($_.Exception.Message)"
+        return [pscustomobject]@{ ClientInstalled = $true; Workloads = $null; WorkloadsReadable = $false }
+    }
+}
+
+function Get-ICTImeLogText {
+    <# The recent part of each Intune Management Extension log written to within the last days. Throws if it cannot read them. #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([int]$Days = 7, [int]$TailLines = 5000)
+    $directory = Join-Path $env:ProgramData 'Microsoft\IntuneManagementExtension\Logs'
+    if (-not (Test-Path -LiteralPath $directory)) { throw "The log folder $directory does not exist." }
+    $cutoff = (Get-Date).AddDays(-$Days)
+    foreach ($file in Get-ChildItem -LiteralPath $directory -Filter '*.log' -File -ErrorAction Stop | Where-Object { $_.LastWriteTime -ge $cutoff }) {
+        (Get-Content -LiteralPath $file.FullName -Tail $TailLines -ErrorAction Stop) -join "`n"
     }
 }
 
@@ -479,6 +513,15 @@ function New-ICTDirectorySecurity {
     return $acl
 }
 
+function New-ICTRestrictedFolder {
+    <# Creates a folder that has the restricted ACL from the first moment. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $security = New-ICTDirectorySecurity
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $null = [System.IO.Directory]::CreateDirectory($Path, $security) }
+    else { [System.IO.FileSystemAclExtensions]::Create((New-Object System.IO.DirectoryInfo($Path)), $security) }
+}
+
 function Assert-ICTTrustedItem {
     <# Throws when an existing file or folder is a reparse point or owned by anyone but SYSTEM, Administrators or the current admin. #>
     [CmdletBinding()]
@@ -502,16 +545,13 @@ function Protect-ICTDirectory {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-ICTIsWindows)) { if (-not (Test-Path -LiteralPath $Path)) { $null = New-Item -Path $Path -ItemType Directory -Force }; return }
 
-    $security = New-ICTDirectorySecurity
-    if (-not (Test-Path -LiteralPath $Path)) {
-        $null = [System.IO.Directory]::CreateDirectory($Path, $security)
-        return
-    }
+    # A folder someone else created in between is caught by the checks below.
+    if (-not (Test-Path -LiteralPath $Path)) { New-ICTRestrictedFolder -Path $Path }
     $folder = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     Assert-ICTTrustedItem -Item $folder
     # Streamed, so a junction is rejected before Get-ChildItem could descend into it.
     Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop | ForEach-Object { Assert-ICTTrustedItem -Item $_ }
-    Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
+    Set-Acl -LiteralPath $Path -AclObject (New-ICTDirectorySecurity) -ErrorAction Stop
 }
 
 function New-ICTPrivateDirectory {
@@ -522,7 +562,7 @@ function New-ICTPrivateDirectory {
     Protect-ICTDirectory -Path $Parent
     $path = Join-Path $Parent ('{0}-{1}' -f $Prefix, [guid]::NewGuid().ToString('N').Substring(0, 8))
     if (Test-Path -LiteralPath $path) { throw "'$path' already exists." }
-    if (Test-ICTIsWindows) { $null = [System.IO.Directory]::CreateDirectory($path, (New-ICTDirectorySecurity)) }
+    if (Test-ICTIsWindows) { New-ICTRestrictedFolder -Path $path }
     else { $null = New-Item -Path $path -ItemType Directory }
     return $path
 }

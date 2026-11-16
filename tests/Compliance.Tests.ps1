@@ -1,5 +1,5 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
     . (Join-Path $PSScriptRoot 'TestData.ps1')
 
     function Get-Result {
@@ -250,6 +250,73 @@ Describe 'Test-ICTCompliance' {
             $data.PendingReboot = [pscustomobject]@{ Pending = $false; Reasons = @() }
             $data.Device.LastBootTime = '2026-09-01T00:00:00Z'
             (Get-Result (& $evaluate) 'HLT-REBOOT').Status | Should -Be 'Warning'
+        }
+
+        It 'shows the extension log errors as information' {
+            $data.ImeLog = [pscustomobject]@{ LookbackDays = 7; OldestEntry = '2026-10-01T00:00:00Z'; ErrorCount = 4; Recent = @([pscustomobject]@{ TimeCreated = '2026-11-05T12:32:00Z'; Component = 'AppWorkload'; Message = 'x' }) }
+            $evaluation = & $evaluate
+            (Get-Result $evaluation 'HLT-IME').Status | Should -Be 'Info'
+            (Get-Result $evaluation 'HLT-IME').Actual | Should -Be '4 errors in 7 days, latest 2 h ago'
+            $evaluation.OverallStatus | Should -Be 'Compliant'
+        }
+
+        It 'names the period the rotated extension logs really cover' {
+            $data.ImeLog = [pscustomobject]@{ LookbackDays = 7; OldestEntry = '2026-11-03T14:32:00Z'; ErrorCount = 0; Recent = @() }
+            (Get-Result (& $evaluate) 'HLT-IME').Actual | Should -Be 'no errors since 2 days ago'
+        }
+
+        It 'does not check the extension log when the extension is not installed' {
+            $data.Services[1].Present = $false
+            Get-Result (& $evaluate) 'HLT-IME' | Should -BeNullOrEmpty
+        }
+
+        It 'shows nothing about ConfigMgr without a client' {
+            Get-Result (& $evaluate) 'HLT-COMGMT' | Should -BeNullOrEmpty
+        }
+
+        It 'decodes the co-management workloads, also with the newer marker bits' -TestCases @(
+            @{ Flags = 11; Text = 'co-managed, 2 workloads in Intune'; Listed = 'Compliance, Device config' }
+            @{ Flags = 8203; Text = 'co-managed, 2 workloads in Intune'; Listed = 'Compliance, Device config' }
+            @{ Flags = 4130; Text = 'co-managed, 2 workloads in Intune'; Listed = 'Compliance, Endpoint protection' }
+        ) {
+            $data.ConfigMgr = [pscustomobject]@{ ClientInstalled = $true; Workloads = $Flags; WorkloadsReadable = $true }
+            $result = Get-Result (& $evaluate) 'HLT-COMGMT'
+            $result.Status | Should -Be 'Info'
+            $result.Actual | Should -Be $Text
+            $result.Message | Should -Match $Listed
+        }
+
+        It 'warns when ConfigMgr keeps the compliance workload' {
+            $data.ConfigMgr = [pscustomobject]@{ ClientInstalled = $true; Workloads = 9; WorkloadsReadable = $true }
+            (Get-Result (& $evaluate) 'HLT-COMGMT').Status | Should -Be 'Warning'
+        }
+
+        It 'does not call a client co-managed when no workload moved' -TestCases @(@{ Flags = 1 }, @{ Flags = 8193 }, @{ Flags = 0 }, @{ Flags = $null }) {
+            $data.ConfigMgr = [pscustomobject]@{ ClientInstalled = $true; Workloads = $Flags; WorkloadsReadable = $true }
+            $data.MdmCertificates = @()
+            $evaluation = & $evaluate
+            (Get-Result $evaluation 'HLT-COMGMT').Actual | Should -Be 'client installed, no workloads in Intune'
+            $evaluation.CanRepairEnrollment | Should -BeTrue
+        }
+
+        It 'blocks re-enrollment when the co-management state cannot be read' {
+            $data.ConfigMgr = [pscustomobject]@{ ClientInstalled = $true; Workloads = $null; WorkloadsReadable = $false }
+            $data.MdmCertificates = @()
+            $evaluation = & $evaluate
+            (Get-Result $evaluation 'HLT-COMGMT').Actual | Should -Be 'client installed, workloads unreadable'
+            $evaluation.Blockers | Should -Contain 'ConfigMgr: the co-management state could not be read'
+        }
+
+        It 'blocks re-enrollment, also behind a sync, but not the sync itself, on co-managed devices' {
+            $data.ConfigMgr = [pscustomobject]@{ ClientInstalled = $true; Workloads = 3; WorkloadsReadable = $true }
+            $data.Sync[0].ServerLastSuccessTime = '2026-10-24T10:00:00Z'
+            $evaluation = & $evaluate
+            $evaluation.RecommendedActions | Should -Be @('Sync')
+            $evaluation.CanRepairEnrollment | Should -BeTrue
+            $evaluation.ReEnrollBlockers | Should -Contain 'Co-management: ConfigMgr controls the MDM enrollment of this device'
+
+            $data.MdmCertificates = @()
+            (& $evaluate).CanRepairEnrollment | Should -BeFalse
         }
 
         It 'shows a capped MDM error count with a plus' {

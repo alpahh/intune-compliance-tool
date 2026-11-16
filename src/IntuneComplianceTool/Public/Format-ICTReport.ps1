@@ -170,6 +170,16 @@ function Format-ICTReport {
     }
     #endregion
 
+    if ($Detailed -and $data.ImeLog -and @($data.ImeLog.Recent).Count -gt 0) {
+        $lines.Add('')
+        $lines.Add('  ' + (& $color ('RECENT EXTENSION LOG ERRORS (latest of the last {0} days)' -f $data.ImeLog.LookbackDays) 'Bold'))
+        foreach ($entry in @($data.ImeLog.Recent)) {
+            $when = (Format-ICTRelativeTime $entry.TimeCreated -Now $utcNow).PadRight(12)
+            $text = Limit-ICTText -Text ('{0}: {1}' -f $entry.Component, $entry.Message) -Width ($Width - 4 - 12) -Theme $theme
+            $lines.Add('    ' + (& $color $when 'Gray') + $text)
+        }
+    }
+
     #region Collection errors
     $collectionErrors = @($data.CollectionErrors | Where-Object { $_ })
     if ($collectionErrors.Count -gt 0) {

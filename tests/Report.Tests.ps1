@@ -1,5 +1,5 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
     . (Join-Path $PSScriptRoot 'TestData.ps1')
 
     $script:ansi = [regex]"$([char]27)\[[0-9;]*m"

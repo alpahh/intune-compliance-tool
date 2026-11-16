@@ -74,7 +74,8 @@ encoded_command() {
   local cleanup=""
   # An old diagnostics ZIP must never be fetched as the current one.
   $wants_diag && cleanup="Remove-Item -LiteralPath (Join-Path \$env:USERPROFILE 'ict-diagnostics.zip') -Force -ErrorAction SilentlyContinue; "
-  local script="\$p = Join-Path \$env:USERPROFILE 'ict-run.ps1'; \$code = 10; $cleanup
+  local script
+  script="\$p = Join-Path \$env:USERPROFILE 'ict-run.ps1'; \$code = 10; $cleanup
 try { & \$p -CommandHint $(ps_quote "$hint")$args; \$code = \$LASTEXITCODE }
 catch { Write-Host ('  ERROR: ' + \$_.Exception.Message) -ForegroundColor Red; \$code = 10 }
 finally { Remove-Item -LiteralPath \$p -Force -ErrorAction SilentlyContinue }
@@ -93,7 +94,8 @@ run_host() {
   [[ ${#hosts[@]} -gt 1 ]] && opts+=(-o BatchMode=yes)
 
   # Relative target = the account's profile folder, which only it and admins can write to.
-  scp -q "${opts[@]}" "$bundle" "$target:ict-run.ps1" || { echo "ict: copying the script to $short failed" >&2; return 12; }
+  # Not -q: it would also hide the reason a connection fails. Stdout off = no progress meter.
+  scp -o LogLevel=ERROR "${opts[@]}" "$bundle" "$target:ict-run.ps1" > /dev/null || { echo "ict: copying the script to $short failed" >&2; return 12; }
 
   # cmd.exe expands %COMSPEC%, PowerShell prints it literally.
   local shell_probe suffix=""
@@ -108,8 +110,9 @@ run_host() {
 
   if $wants_diag && (( status <= 3 )); then
     mkdir -p "$here/diagnostics"
-    local local_zip="$here/diagnostics/${short}-$(date +%Y%m%d-%H%M%S).zip"
-    if scp -q "${opts[@]}" "$target:ict-diagnostics.zip" "$local_zip" 2>/dev/null; then
+    local local_zip
+    local_zip="$here/diagnostics/${short}-$(date +%Y%m%d-%H%M%S).zip"
+    if scp -o LogLevel=ERROR "${opts[@]}" "$target:ict-diagnostics.zip" "$local_zip" > /dev/null 2>&1; then
       echo "  Diagnostics copied to $local_zip" >&2
     fi
   fi
@@ -144,10 +147,11 @@ for i in "${!hosts[@]}"; do
   if (( code > worst )); then worst=$code; fi
   line="$(tr -d '\r' < "$work_dir/out$i" 2>/dev/null | awk 'NF { l = $0 } END { print l }')"
   if [[ -z "$line" ]]; then
-    reason="$(tr -d '\r' < "$work_dir/err$i" 2>/dev/null | awk 'NF { l = $0 } END { print l }')"
+    # Prefer the real ssh/scp message over this script's own summary line.
+    reason="$(tr -d '\r' < "$work_dir/err$i" 2>/dev/null | awk 'NF && !/^ict:/ && !/^scp: Connection closed/ && !/^lost connection/ { l = $0 } NF { a = $0 } END { print (l != "" ? l : a) }')"
     line="$(printf '%s\tUNREACHABLE\t-\t-\t-\t%s' "${hosts[$i]#*@}" "${reason:-ssh failed}")"
   elif [[ "$line" != *$'\t'* ]]; then
-    line="$(printf '%s\tERROR\t-\t-\t-\t%s' "${hosts[$i]#*@}" "$line")"
+    line="$(printf '%s\tERROR\t-\t-\t-\t%s' "${hosts[$i]#*@}" "$(echo "$line" | sed 's/^[[:space:]]*//')")"
   fi
   printf '%s\t%s\n' "$line" "$code" >> "$table"
 done

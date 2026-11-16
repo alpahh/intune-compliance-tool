@@ -4,7 +4,7 @@ Checks a Windows client's Intune MDM enrollment, compliance settings and Windows
 
 ```text
 ╭────────────────────────────────────────────────────────────────────────────╮
-│  INTUNE COMPLIANCE TOOL  v0.2.0                PC-0421 · 2026-11-05 15:32  │
+│  INTUNE COMPLIANCE TOOL  v0.3.0                PC-0421 · 2026-11-05 15:32  │
 ╰────────────────────────────────────────────────────────────────────────────╯
 
   Collecting  ✔ Device  ✔ Join  ✔ Enrollment  ✔ Services  ✔ Security  ✔ LAPS
@@ -85,7 +85,7 @@ With several hosts, `ict.sh` returns the highest code.
 |---|---|
 | Join | Entra / hybrid join, device authentication, MDM auto-enrollment URL, Entra device certificate and key (`dsregcmd /status`) |
 | Enrollment | Intune enrollment, MDM device certificate, sync tasks, last successful check-in; for an unenrolled device the last auto-enrollment error (decoded) and the "managed by another MDM" flag |
-| Health | `dmwappushservice`, Intune Management Extension, MDM error events, pending reboot and uptime |
+| Health | `dmwappushservice`, Intune Management Extension and its log errors, ConfigMgr / co-management workloads, MDM error events, pending reboot and uptime |
 | Network | WinHTTP proxy, TCP 443 to the Intune and Entra endpoints (all at once), clock skew against Microsoft's servers |
 | Security | OS build and, optionally, patch level (UBR), BitLocker, TPM, Secure Boot, Defender real-time protection and signature age, firewall (effective policy) |
 | LAPS | Policy (Intune, Group Policy, local or legacy) and backup target, managed account (also with automatic account management), last rotation, backup errors, post-sign-in actions |
@@ -109,7 +109,7 @@ The person signed in at the device is shown separately from the SSH account. Use
      4. Wait until a complete new enrollment exists (a new enrollment key and a new MDM certificate), then check the device again.
 4. **LAPS:** if the backup failed or the rotation is overdue, run `Invoke-LapsPolicyProcessing` and read the real outcome from the LAPS event log.
 
-The enrollment repair does not start when a blocker is found: for example the device isn't Entra-joined, an endpoint can't be reached, auto-enrollment failed for a reason a new attempt would hit again (no license, user not in MDM scope), or the session isn't elevated. A plain sync is only blocked by problems that would stop it too. `-Force` overrides the blockers, but not the re-enrollment's own safety checks. Problems like BitLocker, firewall or Defender are reported but never "fixed" by re-enrolling.
+The enrollment repair does not start when a blocker is found: for example the device isn't Entra-joined, an endpoint can't be reached, ConfigMgr controls the enrollment on a co-managed device, auto-enrollment failed for a reason a new attempt would hit again (no license, user not in MDM scope), or the session isn't elevated. A plain sync is only blocked by problems that would stop it too. `-Force` overrides the blockers, but not the re-enrollment's own safety checks. Problems like BitLocker, firewall or Defender are reported but never "fixed" by re-enrolling.
 
 Everything is logged to `C:\ProgramData\IntuneComplianceTool\ict.log`. That folder, the reports and the backups are restricted to SYSTEM and Administrators. A folder created by anyone else is refused, because the repair runs a script from it as SYSTEM.
 
@@ -149,6 +149,14 @@ All Windows access goes through `Private/Platform.ps1`, so everything else is te
 pwsh -NoProfile -Command "Invoke-Pester -Path tests -Output Detailed"
 ```
 
+```bash
+/bin/bash tests/ict-sh.test.sh
+```
+
+The second command tests `ict.sh` offline, with fake `ssh` and `scp`.
+
+CI (`.github/workflows/ci.yml`) runs on every push to `main` and `dev/**`: all tests on Windows PowerShell 5.1 and 7, on macOS, ShellCheck, and a smoke test of the finished single-file script on a real Windows machine. `tests/Windows.Integration.Tests.ps1` makes real Windows calls. Its "Running as SYSTEM" part creates scheduled tasks, keys and certificates, so it only runs in CI or with `ICT_RUN_SYSTEM_TESTS=1`. It never starts the real `deviceenroller.exe`.
+
 Source files must stay ASCII: Windows PowerShell 5.1 reads UTF-8 files without a BOM as ANSI. Build symbols from code points (`[char]0x2714`). Tests enforce this, together with PowerShell 5.1-compatible syntax.
 
 ### To verify on a real client
@@ -159,3 +167,4 @@ These details come from documentation and community practice. They haven't been 
 - `LastPasswordUpdateTime` in `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\State`, and the LAPS event IDs (10004/10029 success, 10005 failure).
 - The auto-enrollment events 75/76 and the HRESULT in their message.
 - `MdmDiagnosticsTool.exe -area ... -zip ...` with the areas used here.
+- `ComgmtWorkloads` on `root\ccm\InvAgt:CCM_System` and its workload bits, on a co-managed client and on one that isn't. Microsoft does not document this value.

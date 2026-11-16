@@ -1,7 +1,7 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
     . (Join-Path $PSScriptRoot 'TestData.ps1')
-    $script:dsregLines = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures' 'dsregcmd-hybrid.txt')
+    $script:dsregLines = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/dsregcmd-hybrid.txt')
     $script:enrollmentId = '8C2F41D0-5B7A-4E21-9C3D-2A6B8F1E7D45'
 }
 
@@ -26,6 +26,8 @@ Describe 'Get-ICTDeviceData' {
         }
         Mock -ModuleName $m Get-ICTOmadmConnectionInfo { [pscustomobject]@{ ServerLastSuccessTime = '2026-11-05T12:15:00Z' } }
         Mock -ModuleName $m Get-ICTServiceState { foreach ($n in $Name) { [pscustomobject]@{ Name = $n; Present = $true; Status = 'Running'; StartType = 'Automatic' } } }
+        Mock -ModuleName $m Get-ICTConfigMgrState { [pscustomobject]@{ ClientInstalled = $false; Workloads = $null; WorkloadsReadable = $true } }
+        Mock -ModuleName $m Get-ICTImeLogText { }
         Mock -ModuleName $m Get-ICTBitLockerState { [pscustomobject]@{ ProtectionOn = $true } }
         Mock -ModuleName $m Get-ICTTpmState { [pscustomobject]@{ Present = $true; Ready = $true } }
         Mock -ModuleName $m Get-ICTSecureBootState { [pscustomobject]@{ Supported = $true; Enabled = $true } }
@@ -38,6 +40,13 @@ Describe 'Get-ICTDeviceData' {
         Mock -ModuleName $m Get-ICTWinHttpProxy { [pscustomobject]@{ ProxyConfigured = $false } }
         Mock -ModuleName $m Test-ICTTcpEndpoint { foreach ($h in $HostName) { [pscustomobject]@{ HostName = $h; Port = $Port; Reachable = $true; Error = $null } } }
         Mock -ModuleName $m Get-ICTClockOffset { 2 }
+    }
+
+    It 'reads the extension log only when the extension is installed' {
+        Mock -ModuleName IntuneComplianceTool Get-ICTServiceState { foreach ($n in $Name) { [pscustomobject]@{ Name = $n; Present = ($n -ne 'IntuneManagementExtension'); Status = 'Running'; StartType = 'Automatic' } } }
+        $data = Get-ICTDeviceData
+        $data.ImeLog | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName IntuneComplianceTool -CommandName Get-ICTImeLogText -Times 0 -Exactly
     }
 
     It 'refuses to run on anything but Windows' {

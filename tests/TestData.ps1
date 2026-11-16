@@ -57,6 +57,8 @@ function New-TestDeviceData {
             [pscustomobject]@{ Name = 'dmwappushservice'; Present = $true; Status = 'Stopped'; StartType = 'Manual' }
             [pscustomobject]@{ Name = 'IntuneManagementExtension'; Present = $true; Status = 'Running'; StartType = 'Automatic' }
         )
+        ConfigMgr        = [pscustomobject]@{ ClientInstalled = $false; Workloads = $null; WorkloadsReadable = $true }
+        ImeLog           = [pscustomobject]@{ LookbackDays = 7; ErrorCount = 0; Recent = @() }
         Security         = [pscustomobject]@{
             BitLocker  = [pscustomobject]@{ MountPoint = 'C:'; ProtectionOn = $true; VolumeStatus = 'FullyEncrypted'; EncryptionMethod = 'XtsAes256' }
             Tpm        = [pscustomobject]@{ Present = $true; Ready = $true }

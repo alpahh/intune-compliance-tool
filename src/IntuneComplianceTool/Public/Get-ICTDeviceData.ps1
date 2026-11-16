@@ -26,7 +26,7 @@ function Get-ICTDeviceData {
     if (-not $Section) { $Section = $allSections }
     $sectionProperties = @{
         'Device' = @('RunAs', 'ConsoleUser', 'Device', 'PendingReboot'); 'Join' = @('Join')
-        'Enrollment' = @('AutoEnroll', 'Enrollments', 'MdmCertificates', 'Sync'); 'Services' = @('Services')
+        'Enrollment' = @('AutoEnroll', 'Enrollments', 'MdmCertificates', 'Sync'); 'Services' = @('Services', 'ConfigMgr', 'ImeLog')
         'Security' = @('Security'); 'LAPS' = @('Laps'); 'Network' = @('Network'); 'Event log' = @('MdmEvents')
     }
 
@@ -88,6 +88,11 @@ function Get-ICTDeviceData {
             'Services' {
                 $names = @(@($Config.RequiredServices) + @($Config.RecommendedServices) | Where-Object { $_ })
                 $data.Services = & $collect 'Services' { , @(Get-ICTServiceState -Name $names) }
+                $data.ConfigMgr = & $collect 'ConfigMgr' { Get-ICTConfigMgrState }
+                $data.ImeLog = $null
+                if (@($data.Services | Where-Object { $_ -and $_.Name -eq 'IntuneManagementExtension' -and $_.Present }).Count -gt 0) {
+                    $data.ImeLog = & $collect 'ImeLog' { ConvertFrom-ICTImeLog -Text @(Get-ICTImeLogText -Days $Config.ImeLogLookbackDays) -Days $Config.ImeLogLookbackDays }
+                }
             }
             'Security' {
                 $data.Security = [pscustomobject]@{

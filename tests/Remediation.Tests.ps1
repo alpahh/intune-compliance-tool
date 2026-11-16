@@ -1,7 +1,7 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
-    $script:dsregHybrid = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures' 'dsregcmd-hybrid.txt')
-    $script:dsregNotJoined = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures' 'dsregcmd-notjoined.txt')
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
+    $script:dsregHybrid = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/dsregcmd-hybrid.txt')
+    $script:dsregNotJoined = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/dsregcmd-notjoined.txt')
     $script:oldId = '8C2F41D0-5B7A-4E21-9C3D-2A6B8F1E7D45'
     $script:newId = '9D1E52A1-6C8B-4F32-AD4E-3B7C9A2F8E56'
     $script:orphanId = 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE'

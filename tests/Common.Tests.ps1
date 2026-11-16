@@ -1,5 +1,5 @@
 BeforeAll {
-    Import-Module (Join-Path $PSScriptRoot '..' 'src' 'IntuneComplianceTool' 'IntuneComplianceTool.psd1') -Force
+    Import-Module (Join-Path $PSScriptRoot '../src/IntuneComplianceTool/IntuneComplianceTool.psd1') -Force
 }
 
 Describe 'Date helpers' {
@@ -202,6 +202,17 @@ Describe 'Re-enrollment helpers' {
             $text | Should -Match ([regex]::Escape("'C:\Program Data\it''s\state.jsonl'"))
             $text | Should -Match ([regex]::Escape("-ArgumentList '/c /AutoEnrollMDM'"))
             $text | Should -Match ([regex]::Escape("@('ABC')"))
+        }
+    }
+
+    It 'runs the real enroller by default and only a given program otherwise' {
+        InModuleScope IntuneComplianceTool {
+            $default = New-ICTRepairScript -EnrollerArgument '/c /AutoEnrollMDM' -StatePath 'C:\s.jsonl'
+            ($default -split "`r?`n") | Should -Contain ('    $enroller = Join-Path $env:windir ' + "'System32\deviceenroller.exe'")
+
+            $stub = New-ICTRepairScript -EnrollerPath 'C:\Windows\System32\cmd.exe' -EnrollerArgument '/c exit 0' -StatePath 'C:\s.jsonl'
+            ($stub -split "`r?`n") | Should -Contain ('    $enroller = ' + "'C:\Windows\System32\cmd.exe'")
+            $stub | Should -Not -Match 'deviceenroller'
         }
     }
 
